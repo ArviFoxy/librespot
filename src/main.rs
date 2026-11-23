@@ -19,6 +19,11 @@ use librespot::{
         player::{Player, coefficient_to_duration, duration_to_coefficient},
     },
 };
+#[cfg(feature = "mix-transitions")]
+use librespot::{
+    connect::{MixConfig, MixMode},
+    playback::mix::TimeStretchMode,
+};
 use librespot_oauth::{DeviceAuthClientBuilder, OAuthClientBuilder};
 use log::{debug, error, info, trace, warn};
 use sha1::{Digest, Sha1};
@@ -271,6 +276,12 @@ async fn get_setup() -> Setup {
     const ONEVENT: &str = "onevent";
     #[cfg(feature = "passthrough-decoder")]
     const PASSTHROUGH: &str = "passthrough";
+    #[cfg(feature = "mix-transitions")]
+    const MIX_MODE: &str = "mix-mode";
+    #[cfg(feature = "mix-transitions")]
+    const MIX_MAX_BPM_RATIO: &str = "mix-max-bpm-ratio";
+    #[cfg(feature = "mix-transitions")]
+    const MIX_TIME_STRETCH: &str = "mix-time-stretch";
     const PASSWORD: &str = "password";
     const PROXY: &str = "proxy";
     const QUIET: &str = "quiet";
@@ -682,6 +693,26 @@ async fn get_setup() -> Setup {
         PASSTHROUGH_SHORT,
         PASSTHROUGH,
         "Pass a raw stream to the output. Only works with the pipe and subprocess backends.",
+    );
+
+    #[cfg(feature = "mix-transitions")]
+    opts.optopt(
+        "",
+        MIX_MODE,
+        "Spotify Mix dual-deck transition mode {off|auto|force-auto}. Defaults to auto.",
+        "MODE",
+    )
+    .optopt(
+        "",
+        MIX_MAX_BPM_RATIO,
+        "Maximum BPM ratio for beatmatched transitions (1.0 - 1.5). Defaults to 1.08.",
+        "RATIO",
+    )
+    .optopt(
+        "",
+        MIX_TIME_STRETCH,
+        "Time-stretcher mode for beatmatching {pitch-preserving|varispeed|off}. Defaults to pitch-preserving.",
+        "STRETCHER",
     );
 
     let args: Vec<_> = std::env::args_os()
@@ -1552,6 +1583,44 @@ async fn get_setup() -> Setup {
         let disable_volume = matches!(mixer_config.volume_ctrl, VolumeCtrl::Fixed);
         let volume_steps = volume_steps.unwrap_or(connect_default_config.volume_steps);
 
+        #[cfg(feature = "mix-transitions")]
+        let mix_config = {
+            let mut cfg = MixConfig::default();
+            if let Some(raw_mode) = opt_str(MIX_MODE) {
+                cfg.mode = MixMode::from_str(&raw_mode).unwrap_or_else(|_| {
+                    invalid_error_msg(MIX_MODE, "", &raw_mode, "off, auto, force-auto", "auto");
+                    exit(1);
+                });
+            }
+            if let Some(raw_ratio) = opt_str(MIX_MAX_BPM_RATIO) {
+                match raw_ratio.parse::<f64>() {
+                    Ok(v) if (1.0..=1.5).contains(&v) => cfg.max_bpm_ratio = v,
+                    _ => {
+                        invalid_error_msg(MIX_MAX_BPM_RATIO, "", &raw_ratio, "1.0 - 1.5", "1.08");
+                        exit(1);
+                    }
+                }
+            }
+            if let Some(raw_stretch) = opt_str(MIX_TIME_STRETCH) {
+                cfg.stretch_mode = match raw_stretch.trim().to_ascii_lowercase().as_str() {
+                    "pitch-preserving" | "keylock" => TimeStretchMode::PitchPreserving,
+                    "varispeed" => TimeStretchMode::Varispeed,
+                    "off" | "none" => TimeStretchMode::Off,
+                    _ => {
+                        invalid_error_msg(
+                            MIX_TIME_STRETCH,
+                            "",
+                            &raw_stretch,
+                            "pitch-preserving, varispeed, off",
+                            "pitch-preserving",
+                        );
+                        exit(1);
+                    }
+                };
+            }
+            cfg
+        };
+
         ConnectConfig {
             name,
             device_type,
@@ -1560,6 +1629,8 @@ async fn get_setup() -> Setup {
             disable_volume,
             volume_steps,
             emit_set_queue_events: false,
+            #[cfg(feature = "mix-transitions")]
+            mix_config,
         }
     };
 

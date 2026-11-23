@@ -148,6 +148,11 @@ name = "librespot"
 path = "src/main.rs"
 doc = false
 
+[[example]]
+name = "render_transition"
+path = "examples/render_transition.rs"
+required-features = ["mix-transitions"]
+
 [workspace.dependencies]
 librespot-audio = { version = "0.8.0", path = "audio", default-features = false }
 librespot-connect = { version = "0.8.0", path = "connect", default-features = false }

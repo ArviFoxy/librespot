@@ -373,6 +373,26 @@ impl<'ct> ConnectState {
         SpotifyUri::from_uri(next).ok()
     }
 
+    /// Return `(current_track, next_track, current_duration_ms)` for background transition
+    /// resolution without mutating queue state.
+    #[cfg(feature = "mix-transitions")]
+    pub fn transition_pair_snapshot(&self) -> Option<(ProvidedTrack, ProvidedTrack, u32)> {
+        let current = self.player().track.as_ref()?.clone();
+        if current.uri.is_empty() {
+            return None;
+        }
+        let next = if self.repeat_track() {
+            current.clone()
+        } else {
+            self.next_tracks().first()?.clone()
+        };
+        if next.uri.is_empty() {
+            return None;
+        }
+        let duration_ms = self.player().duration.max(0) as u32;
+        Some((current, next, duration_ms))
+    }
+
     /// Atomically commit a dual-deck transition to `incoming_track_id` without issuing
     /// a redundant `Player::load`.
     ///

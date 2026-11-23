@@ -7,6 +7,8 @@ mod restrictions;
 mod tracks;
 mod transfer;
 
+#[cfg(feature = "mix-transitions")]
+use crate::mix::{MixConfig, MixMode};
 use crate::{
     core::{
         Error, Session, config::DeviceType, date::Date, dealer::protocol::Request,
@@ -92,6 +94,9 @@ pub struct ConnectConfig {
     pub volume_steps: u16,
     /// Emit `SetQueue` player events when the queue changes (default: false)
     pub emit_set_queue_events: bool,
+    /// Spotify Mix dual-deck transition configuration (available with `mix-transitions` feature).
+    #[cfg(feature = "mix-transitions")]
+    pub mix_config: MixConfig,
 }
 
 impl Default for ConnectConfig {
@@ -104,6 +109,8 @@ impl Default for ConnectConfig {
             disable_volume: false,
             volume_steps: 64,
             emit_set_queue_events: false,
+            #[cfg(feature = "mix-transitions")]
+            mix_config: MixConfig::default(),
         }
     }
 }
@@ -184,6 +191,10 @@ impl ConnectState {
                 // that "AI" dj thingy only available to specific regions/users
                 supports_dj: false,
                 supports_rooms: false,
+                #[cfg(feature = "mix-transitions")]
+                supports_playlist_mixing: cfg.mix_config.mode != MixMode::Off,
+                #[cfg(feature = "mix-transitions")]
+                supports_gapless: true,
                 // AudioQuality::HIFI is available, further investigation necessary
                 supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),
 

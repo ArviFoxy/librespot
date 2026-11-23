@@ -1,3 +1,11 @@
+#[cfg(feature = "mix-transitions")]
+use crate::mix::{
+    MixMode,
+    resolver::{
+        TransitionResolveRequest, TransitionResolveResult, TransitionResolver,
+        context_signals_mixed,
+    },
+};
 use crate::{
     LoadContextOptions, LoadRequestOptions, PlayContext,
     context_resolver::{ContextAction, ContextResolver, ResolveContext},
@@ -95,6 +103,15 @@ struct SpircTask {
 
     context_resolver: ContextResolver,
 
+    #[cfg(feature = "mix-transitions")]
+    transition_resolver: TransitionResolver,
+    #[cfg(feature = "mix-transitions")]
+    transition_generation: u64,
+    #[cfg(feature = "mix-transitions")]
+    transition_tx: mpsc::UnboundedSender<TransitionResolveResult>,
+    #[cfg(feature = "mix-transitions")]
+    transition_rx: Option<mpsc::UnboundedReceiver<TransitionResolveResult>>,
+
     emit_set_queue_events: bool,
 
     shutdown: bool,
@@ -177,6 +194,8 @@ impl Spirc {
         debug!("new Spirc[{spirc_id}]");
 
         let emit_set_queue_events = config.emit_set_queue_events;
+        #[cfg(feature = "mix-transitions")]
+        let mix_config = config.mix_config.clone();
         let connect_state = ConnectState::new(config, &session);
 
         let connection_id_update = session
@@ -226,6 +245,8 @@ impl Spirc {
         let _ = session.login5().auth_token().await?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        #[cfg(feature = "mix-transitions")]
+        let (transition_tx, transition_rx) = mpsc::unbounded_channel();
 
         let player_events = player.get_player_event_channel();
 
@@ -252,6 +273,15 @@ impl Spirc {
             player_events: Some(player_events),
 
             context_resolver: ContextResolver::new(session.clone()),
+
+            #[cfg(feature = "mix-transitions")]
+            transition_resolver: TransitionResolver::new(mix_config),
+            #[cfg(feature = "mix-transitions")]
+            transition_generation: 0,
+            #[cfg(feature = "mix-transitions")]
+            transition_tx,
+            #[cfg(feature = "mix-transitions")]
+            transition_rx: Some(transition_rx),
 
             emit_set_queue_events,
 
@@ -483,6 +513,10 @@ impl SpircTask {
         while !self.session.is_invalid() && !self.shutdown {
             let commands = self.commands.as_mut();
             let player_events = self.player_events.as_mut();
+            #[cfg(feature = "mix-transitions")]
+            let transition_results = self.transition_rx.as_mut();
+            #[cfg(not(feature = "mix-transitions"))]
+            let transition_results: Option<&mut mpsc::UnboundedReceiver<()>> = None;
 
             // when state and volume update have a higher priority than context resolving
             // because of that the context resolving has to wait, so that the other tasks can finish
@@ -554,6 +588,10 @@ impl SpircTask {
                         error!("could not dispatch player event: {e}");
                     }
                 },
+                resolved = async { transition_results?.recv().await }, if transition_results.is_some() => if let Some(_resolved) = resolved {
+                    #[cfg(feature = "mix-transitions")]
+                    self.handle_transition_resolved(_resolved);
+                },
                 _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
                     self.update_state = false;
 
@@ -596,6 +634,8 @@ impl SpircTask {
                     }).await
                 }, if allow_context_resolving && self.context_resolver.has_next() => {
                     let update_state = self.handle_next_context(next_context);
+                    #[cfg(feature = "mix-transitions")]
+                    self.trigger_transition_resolve();
                     if update_state {
                         if let Err(why) = self.notify().await {
                             error!("update after context resolving failed: {why}")
@@ -769,6 +809,8 @@ impl SpircTask {
                 self.player.cancel_transition();
                 self.connect_state.clear_queue()?;
                 self.emit_set_queue_event();
+                #[cfg(feature = "mix-transitions")]
+                self.trigger_transition_resolve();
             }
         };
 
@@ -779,6 +821,8 @@ impl SpircTask {
         if let PlayerEvent::TrackChanged { audio_item } = event {
             self.connect_state.update_duration(audio_item.duration_ms);
             self.update_state = true;
+            #[cfg(feature = "mix-transitions")]
+            self.trigger_transition_resolve();
             return Ok(());
         }
 
@@ -1191,12 +1235,16 @@ impl SpircTask {
                 self.player.cancel_transition();
                 self.connect_state.add_to_queue(add_to_queue.track, true);
                 self.emit_set_queue_event();
+                #[cfg(feature = "mix-transitions")]
+                self.trigger_transition_resolve();
             }
             SetQueue(set_queue) => {
                 #[cfg(feature = "mix-transitions")]
                 self.player.cancel_transition();
                 self.connect_state.handle_set_queue(set_queue);
                 self.emit_set_queue_event();
+                #[cfg(feature = "mix-transitions")]
+                self.trigger_transition_resolve();
             }
             SetOptions(set_options) => {
                 if let Some(repeat_context) = set_options.repeating_context {
@@ -1217,6 +1265,8 @@ impl SpircTask {
                     #[cfg(feature = "mix-transitions")]
                     self.player.cancel_transition();
                     self.connect_state.set_modes(modes);
+                    #[cfg(feature = "mix-transitions")]
+                    self.trigger_transition_resolve();
                 }
             }
             SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
@@ -1681,7 +1731,12 @@ impl SpircTask {
         #[cfg(feature = "mix-transitions")]
         self.player.cancel_transition();
         self.player.emit_shuffle_changed_event(shuffle);
-        self.connect_state.handle_shuffle(shuffle)
+        let res = self.connect_state.handle_shuffle(shuffle);
+        #[cfg(feature = "mix-transitions")]
+        if res.is_ok() {
+            self.trigger_transition_resolve();
+        }
+        res
     }
 
     fn handle_repeat_context(&mut self, repeat: bool) -> Result<(), Error> {
@@ -1696,6 +1751,8 @@ impl SpircTask {
         self.player
             .emit_repeat_changed_event(self.connect_state.repeat_context(), repeat);
         self.connect_state.set_repeat_track(repeat);
+        #[cfg(feature = "mix-transitions")]
+        self.trigger_transition_resolve();
     }
 
     async fn handle_add_to_queue(&mut self, uri: SpotifyUri) {
@@ -1730,6 +1787,8 @@ impl SpircTask {
             self.connect_state.add_to_queue(track, true);
         }
         self.emit_set_queue_event();
+        #[cfg(feature = "mix-transitions")]
+        self.trigger_transition_resolve();
     }
 
     fn handle_preload_next_track(&mut self) {
@@ -1861,6 +1920,87 @@ impl SpircTask {
     }
 
     #[cfg(feature = "mix-transitions")]
+    fn trigger_transition_resolve(&mut self) {
+        if self.transition_resolver.config().mode == MixMode::Off {
+            return;
+        }
+        let Some((current, next, current_duration_ms)) =
+            self.connect_state.transition_pair_snapshot()
+        else {
+            return;
+        };
+        let (Ok(current_track_id), Ok(next_track_id)) = (
+            SpotifyUri::from_uri(&current.uri),
+            SpotifyUri::from_uri(&next.uri),
+        ) else {
+            return;
+        };
+
+        // Only resolve transitions for Spotify tracks (skip podcasts/episodes/local files).
+        if !matches!(current_track_id, SpotifyUri::Track { .. })
+            || !matches!(next_track_id, SpotifyUri::Track { .. })
+        {
+            return;
+        }
+
+        self.transition_generation = self.transition_generation.wrapping_add(1);
+        let generation = self.transition_generation;
+
+        let ctx_meta = self
+            .connect_state
+            .get_context(ContextType::Default)
+            .ok()
+            .map(|c| &c.metadata);
+        let signals_mixed = context_signals_mixed(
+            self.connect_state.modes(),
+            ctx_meta,
+            Some(&current),
+            Some(&next),
+        );
+
+        let req = TransitionResolveRequest {
+            generation,
+            context_uri: self.connect_state.context_uri().clone(),
+            context_signals_mixed: signals_mixed,
+            current_track_id,
+            current_row_uid: current.uid,
+            current_duration_ms,
+            current_metadata: current.metadata,
+            next_track_id,
+            next_row_uid: next.uid,
+            next_duration_ms: 0,
+            next_metadata: next.metadata,
+        };
+
+        let resolver = self.transition_resolver.clone();
+        let session = self.session.clone();
+        let tx = self.transition_tx.clone();
+        tokio::spawn(async move {
+            let resolved = resolver.resolve(&session, req).await;
+            let _ = tx.send(resolved);
+        });
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn handle_transition_resolved(&mut self, resolved: TransitionResolveResult) {
+        if resolved.generation != self.transition_generation {
+            return;
+        }
+        let Some((current, next, _)) = self.connect_state.transition_pair_snapshot() else {
+            return;
+        };
+        if current.uri != resolved.current_track_id.to_uri()
+            || next.uri != resolved.next_track_id.to_uri()
+        {
+            return;
+        }
+        if let Some(spec) = resolved.spec {
+            self.player
+                .schedule_transition(resolved.next_track_id, spec);
+        }
+    }
+
+    #[cfg(feature = "mix-transitions")]
     fn handle_transition_commit(
         &mut self,
         incoming_track_id: &SpotifyUri,
@@ -1890,6 +2030,7 @@ impl SpircTask {
             },
         };
         self.connect_state.set_status(&self.play_status);
+        self.trigger_transition_resolve();
         Ok(())
     }
 
@@ -1911,7 +2052,14 @@ impl SpircTask {
 
         debug!("playlist modification for current context: {uri}");
         #[cfg(feature = "mix-transitions")]
-        self.player.cancel_transition();
+        {
+            self.player.cancel_transition();
+            let resolver = self.transition_resolver.clone();
+            let inv_uri = uri.clone();
+            tokio::spawn(async move {
+                resolver.invalidate_playlist(&inv_uri).await;
+            });
+        }
         self.context_resolver.add(ResolveContext::from_uri(
             uri,
             self.connect_state.current_track(|t| &t.uri),
