@@ -383,7 +383,7 @@ mod tests {
         state.finish_transfer(transfer).expect("finish_transfer");
 
         let ctx = state.get_context(ContextType::Default).unwrap();
-        let a = ctx.tracks.get(0).unwrap();
+        let a = ctx.tracks.first().unwrap();
         let b = ctx.tracks.get(1).unwrap();
         assert_eq!(
             a.metadata

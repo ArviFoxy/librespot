@@ -731,19 +731,83 @@ fn vocal_clash_score(
     sum / STEPS as f64
 }
 
+/// Estimate track duration in seconds from explicit `duration_ms`, falling back to the `BEATS` grid tail.
+fn effective_duration_sec(meta: &TrackMixMetadata) -> f64 {
+    if meta.duration_ms > 0 {
+        return f64::from(meta.duration_ms) / 1000.0;
+    }
+    if let Some(ref grid) = meta.beats {
+        if let Some(last) = grid.beats.last() {
+            let end = last.time_sec + last.duration_sec.max(0.0);
+            if end > 1.0 {
+                return end;
+            }
+        }
+    }
+    0.0
+}
+
 fn collect_out_cues(meta: &TrackMixMetadata, dur_a_sec: f64) -> Vec<(f64, f64)> {
     let mut out = Vec::new();
     if let Some(ref cues) = meta.cuepoints {
+        let best_out_sec = cues
+            .best_fade_out_cuepoint
+            .as_ref()
+            .map(|c| c.position_ms.max(0) as f64 / 1000.0);
+
         if let Some(best) = cues.best_fade_out_cuepoint.as_ref() {
-            out.push((
-                best.position_ms.max(0) as f64 / 1000.0,
-                cue_bonus(best, true),
-            ));
+            let sec = best.position_ms.max(0) as f64 / 1000.0;
+            if dur_a_sec <= 45.0 || sec >= 12.0 {
+                out.push((sec, cue_bonus(best, true)));
+            }
         }
+
+        // Spotify's `fade_out_cuepoints` lists phrase boundaries spanning the entire track
+        // (for the manual mix editor), not only the outro. Restrict secondary Auto DJ
+        // candidates to the outro region so vocal-clash scoring cannot cut off most of a song.
+        let best_in_a_sec = cues
+            .best_fade_in_cuepoint
+            .as_ref()
+            .map(|c| c.position_ms.max(0) as f64 / 1000.0);
+        let min_out_end_sec = if dur_a_sec > 0.0 {
+            let mut floor = (dur_a_sec * 0.65).max(dur_a_sec - 90.0);
+            if let Some(best_sec) = best_out_sec {
+                if best_sec >= dur_a_sec * 0.45 && best_sec < floor {
+                    floor = (best_sec - 16.0).max(dur_a_sec * 0.45);
+                }
+            }
+            if let Some(in_sec) = best_in_a_sec {
+                if dur_a_sec >= 45.0 {
+                    floor = floor.max((in_sec + 24.0).min(dur_a_sec * 0.65));
+                }
+            }
+            floor
+        } else if let Some(best_sec) = best_out_sec {
+            (best_sec * 0.75).max(best_sec - 60.0)
+        } else {
+            let max_sec = cues
+                .fade_out_cuepoints
+                .iter()
+                .map(|c| c.position_ms.max(0) as f64 / 1000.0)
+                .fold(0.0_f64, f64::max);
+            (max_sec * 0.75).max(max_sec - 60.0)
+        };
+
         for c in &cues.fade_out_cuepoints {
             let sec = c.position_ms.max(0) as f64 / 1000.0;
+            if sec < min_out_end_sec {
+                continue;
+            }
             if out.iter().all(|&(t, _)| (t - sec).abs() > 0.5) {
                 out.push((sec, cue_bonus(c, false)));
+            }
+        }
+
+        // Safety fallback if every cuepoint was filtered out: keep the latest phrase cuepoint.
+        if out.is_empty() {
+            if let Some(latest) = cues.fade_out_cuepoints.iter().max_by_key(|c| c.position_ms) {
+                let sec = latest.position_ms.max(0) as f64 / 1000.0;
+                out.push((sec, cue_bonus(latest, false)));
             }
         }
     }
@@ -754,17 +818,42 @@ fn collect_out_cues(meta: &TrackMixMetadata, dur_a_sec: f64) -> Vec<(f64, f64)> 
     out
 }
 
-fn collect_in_cues(meta: &TrackMixMetadata) -> Vec<(f64, f64)> {
+fn collect_in_cues(meta: &TrackMixMetadata, dur_b_sec: f64) -> Vec<(f64, f64)> {
     let mut inc = Vec::new();
     if let Some(ref cues) = meta.cuepoints {
+        let best_in_sec = cues
+            .best_fade_in_cuepoint
+            .as_ref()
+            .map(|c| c.position_ms.max(0) as f64 / 1000.0);
+
         if let Some(best) = cues.best_fade_in_cuepoint.as_ref() {
-            inc.push((
-                best.position_ms.max(0) as f64 / 1000.0,
-                cue_bonus(best, true),
-            ));
+            let sec = best.position_ms.max(0) as f64 / 1000.0;
+            if dur_b_sec <= 0.0 || sec <= dur_b_sec * 0.50 {
+                inc.push((sec, cue_bonus(best, true)));
+            }
         }
+
+        // Restrict secondary `fade_in_cuepoints` to the intro region so Auto DJ does not
+        // skip halfway into Track B just to dodge vocals in the intro.
+        let max_in_sec = if dur_b_sec > 0.0 {
+            let mut ceil = (dur_b_sec * 0.30).min(60.0);
+            if let Some(best_sec) = best_in_sec {
+                if best_sec > ceil {
+                    ceil = (best_sec + 16.0).min(dur_b_sec * 0.45);
+                }
+            }
+            ceil
+        } else if let Some(best_sec) = best_in_sec {
+            (best_sec + 16.0).clamp(45.0, 75.0)
+        } else {
+            60.0
+        };
+
         for c in &cues.fade_in_cuepoints {
             let sec = c.position_ms.max(0) as f64 / 1000.0;
+            if sec > max_in_sec {
+                continue;
+            }
             if inc.iter().all(|&(t, _)| (t - sec).abs() > 0.5) {
                 inc.push((sec, cue_bonus(c, false)));
             }
@@ -779,7 +868,7 @@ fn collect_in_cues(meta: &TrackMixMetadata) -> Vec<(f64, f64)> {
 fn cue_bonus(c: &Cuepoint, is_best: bool) -> f64 {
     let mut s = c.confidence.clamp(0.0, 1.0) * 0.5;
     if is_best {
-        s += 0.35;
+        s += 0.65;
     }
     if c.origin.enum_value_or_default() == Origin::HUMAN {
         s += 0.25;
@@ -798,8 +887,8 @@ pub fn synthesize_auto_transition(
         return None;
     }
 
-    let dur_a_sec = f64::from(meta_a.duration_ms) / 1000.0;
-    let dur_b_sec = f64::from(meta_b.duration_ms) / 1000.0;
+    let dur_a_sec = effective_duration_sec(meta_a);
+    let dur_b_sec = effective_duration_sec(meta_b);
     if dur_a_sec > 0.0 && dur_a_sec < 12.0 {
         return None;
     }
@@ -828,10 +917,22 @@ pub fn synthesize_auto_transition(
         camelot_compatibility_tier(meta_a.camelot_key.as_deref(), meta_b.camelot_key.as_deref());
 
     let out_cues = collect_out_cues(meta_a, dur_a_sec);
-    let in_cues = collect_in_cues(meta_b);
+    let in_cues = collect_in_cues(meta_b, dur_b_sec);
     if out_cues.is_empty() || in_cues.is_empty() {
         return None;
     }
+
+    let min_start_a_sec = if dur_a_sec >= 45.0 {
+        let best_in_a = meta_a
+            .cuepoints
+            .as_ref()
+            .and_then(|c| c.best_fade_in_cuepoint.as_ref())
+            .map(|c| c.position_ms.max(0) as f64 / 1000.0)
+            .unwrap_or(0.0);
+        (best_in_a + 16.0).min(dur_a_sec * 0.50).max(4.0)
+    } else {
+        4.0
+    };
 
     if let Some((ba, bb, folded_b)) = beatmatch_bpm {
         let beats_per_bar = meta_a
@@ -868,7 +969,7 @@ pub fn synthesize_auto_transition(
                     // back-compute `start_a` in Track A's native tempo clock before snapping.
                     let dur_a_native = f64::from(bars * beats_per_bar) * 60.0 / ba;
                     let raw_start_a = end_a - dur_a_native;
-                    if raw_start_a < 4.0 {
+                    if raw_start_a < min_start_a_sec {
                         continue;
                     }
                     let start_a = meta_a
@@ -876,7 +977,7 @@ pub fn synthesize_auto_transition(
                         .as_ref()
                         .map(|g| snap_to_downbeat(g, raw_start_a, 1.5))
                         .unwrap_or(raw_start_a);
-                    if start_a < 4.0 {
+                    if start_a < min_start_a_sec {
                         continue;
                     }
                     if dur_a_sec > 0.0 && start_a + dur_a_native > dur_a_sec + 0.5 {
@@ -900,7 +1001,18 @@ pub fn synthesize_auto_transition(
                         (16, false) => 0.10,
                         _ => 0.0,
                     };
-                    let total_score = score_a + score_b + bar_pref - clash * 1.4;
+                    let out_pos_bonus = if dur_a_sec > 0.0 {
+                        (end_a / dur_a_sec).clamp(0.0, 1.0) * 0.35
+                    } else {
+                        0.0
+                    };
+                    let in_pos_penalty = if dur_b_sec > 0.0 {
+                        (start_b / dur_b_sec).clamp(0.0, 1.0) * 0.25
+                    } else {
+                        0.0
+                    };
+                    let total_score =
+                        score_a + score_b + bar_pref + out_pos_bonus - in_pos_penalty - clash * 1.1;
                     if best.is_none_or(|(bs, _, _, _)| total_score > bs) {
                         best = Some((total_score, start_a, start_b, bars));
                     }
@@ -1138,9 +1250,10 @@ impl TransitionResolver {
         // 5. Priority 3: client-side Auto DJ synthesizer from Spotify track analysis extensions.
         if let Some(spec) = synthesize_auto_transition(&meta_a, &meta_b, &self.config) {
             debug!(
-                "Synthesized Auto transition for <{uri_a}> -> <{uri_b}> (beatmatched={}, start_a_frame={}, dur_frames={})",
+                "Synthesized Auto transition for <{uri_a}> -> <{uri_b}> (beatmatched={}, start_a_frame={}, start_b_frame={}, dur_frames={})",
                 spec.tempo.as_ref().is_some_and(|t| t.beatmatched),
                 spec.start_a_frame,
+                spec.start_b_frame,
                 spec.duration_frames
             );
             result.spec = Some(spec);
@@ -1904,5 +2017,167 @@ mod tests {
         assert!(spec_bm.tempo.as_ref().unwrap().beatmatched);
         assert_eq!(spec_bm.duration_beats, Some(32.0));
         assert!(spec_bm.out_curves.eq_low.is_some());
+    }
+
+    #[test]
+    fn auto_synthesizer_restricts_secondary_cuepoints_to_outro_and_intro_windows() {
+        let cfg = MixConfig::default();
+
+        // Build vocal activity tracks at 10 Hz (`source_sample_rate_hz = 10`, `samples_between_windows = 1`)
+        // where Track A has heavy vocals around its outro (210..240 s) and zero vocals at an early phrase (35..65 s),
+        // and Track B has heavy vocals in its intro (0..35 s) and zero vocals deep in the middle (120..160 s).
+        let mut probs_a = vec![0i32; 2600];
+        for p in &mut probs_a[2100..2400] {
+            *p = 100;
+        }
+        let mut probs_b = vec![0i32; 2600];
+        for p in &mut probs_b[0..350] {
+            *p = 100;
+        }
+        let va_a = VocalActivity {
+            source_sample_rate_hz: 10.0,
+            samples_between_windows: 1,
+            first_window_sample_start: 0,
+            vocal_activity_probabilities: probs_a,
+            ..Default::default()
+        };
+        let va_b = VocalActivity {
+            source_sample_rate_hz: 10.0,
+            samples_between_windows: 1,
+            first_window_sample_start: 0,
+            vocal_activity_probabilities: probs_b,
+            ..Default::default()
+        };
+
+        let meta_a = TrackMixMetadata {
+            duration_ms: 256_000,
+            bpm: Some(150.0),
+            camelot_key: Some("2B".to_string()),
+            beats: Some(regular_beat_grid(150.0, 256.0)),
+            vocal_activity: Some(va_a),
+            cuepoints: Some(Cuepoints {
+                best_fade_in_cuepoint: MessageField::some(Cuepoint {
+                    position_ms: 25_600,
+                    tempo_bpm: 150.0,
+                    confidence: 0.7,
+                    ..Default::default()
+                }),
+                best_fade_out_cuepoint: MessageField::some(Cuepoint {
+                    position_ms: 230_000,
+                    tempo_bpm: 150.0,
+                    confidence: 0.5,
+                    ..Default::default()
+                }),
+                fade_out_cuepoints: vec![
+                    Cuepoint {
+                        position_ms: 51_200, // Early vocal-free phrase (must be rejected)
+                        tempo_bpm: 150.0,
+                        confidence: 0.95,
+                        ..Default::default()
+                    },
+                    Cuepoint {
+                        position_ms: 110_000, // Mid-track phrase (must be rejected)
+                        tempo_bpm: 150.0,
+                        confidence: 0.95,
+                        ..Default::default()
+                    },
+                    Cuepoint {
+                        position_ms: 205_000, // Valid vocal-free outro phrase (80% of 256 s)
+                        tempo_bpm: 150.0,
+                        confidence: 0.85,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            mixable: Some(true),
+            beatmatchability: Some(0.95),
+            ..Default::default()
+        };
+
+        // Leave `duration_ms = 0` on Track B (matching live Spirc where Track B isn't loaded yet)
+        // so duration must be inferred from Track B's `BEATS` grid tail.
+        let meta_b = TrackMixMetadata {
+            duration_ms: 0,
+            bpm: Some(150.0),
+            camelot_key: Some("2B".to_string()),
+            beats: Some(regular_beat_grid(150.0, 256.0)),
+            vocal_activity: Some(va_b),
+            cuepoints: Some(Cuepoints {
+                best_fade_in_cuepoint: MessageField::some(Cuepoint {
+                    position_ms: 16_000,
+                    tempo_bpm: 150.0,
+                    confidence: 0.5,
+                    ..Default::default()
+                }),
+                fade_in_cuepoints: vec![
+                    Cuepoint {
+                        position_ms: 48_000, // Valid vocal-free intro phrase (within <= 60 s)
+                        tempo_bpm: 150.0,
+                        confidence: 0.8,
+                        ..Default::default()
+                    },
+                    Cuepoint {
+                        position_ms: 140_000, // Mid-track phrase (must be rejected)
+                        tempo_bpm: 150.0,
+                        confidence: 0.99,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            mixable: Some(true),
+            beatmatchability: Some(0.95),
+            ..Default::default()
+        };
+
+        let spec = synthesize_auto_transition(&meta_a, &meta_b, &cfg)
+            .expect("auto synthesizer must find valid outro/intro pair");
+        let start_a_sec = spec.start_a_frame as f64 / f64::from(SAMPLE_RATE);
+        let start_b_sec = spec.start_b_frame as f64 / f64::from(SAMPLE_RATE);
+
+        // Track A must fade out in its outro region (>= 180 s), never at 38.4 s or 97 s.
+        assert!(
+            start_a_sec >= 180.0,
+            "Auto DJ cut off Track A too early: start_a_sec={start_a_sec}"
+        );
+        // Track B must enter in its intro region (<= 60 s), never at 140 s.
+        assert!(
+            start_b_sec <= 60.0,
+            "Auto DJ skipped too far into Track B: start_b_sec={start_b_sec}"
+        );
+
+        // Even when the ONLY secondary fade_out_cuepoints are early (51 s, 110 s) and the
+        // outro `best_fade_out_cuepoint` (230 s) has heavy vocal overlap, Auto DJ must still
+        // stay at the outro rather than cutting off the first half of Track A.
+        let mut meta_a_only_early = meta_a;
+        meta_a_only_early
+            .cuepoints
+            .as_mut()
+            .unwrap()
+            .fade_out_cuepoints
+            .retain(|c| c.position_ms < 150_000);
+        let mut meta_b_only_late = meta_b;
+        meta_b_only_late
+            .cuepoints
+            .as_mut()
+            .unwrap()
+            .fade_in_cuepoints
+            .retain(|c| c.position_ms > 100_000);
+
+        let spec_best = synthesize_auto_transition(&meta_a_only_early, &meta_b_only_late, &cfg)
+            .expect("auto synthesizer must fall back to best outro/intro cuepoints");
+        let best_start_a_sec = spec_best.start_a_frame as f64 / f64::from(SAMPLE_RATE);
+        let best_dur_sec = spec_best.duration_frames as f64 / f64::from(SAMPLE_RATE);
+        let best_end_a_sec = best_start_a_sec + best_dur_sec;
+        let best_start_b_sec = spec_best.start_b_frame as f64 / f64::from(SAMPLE_RATE);
+        assert!(
+            best_start_a_sec >= 200.0 && (best_end_a_sec - 230.0).abs() <= 2.0,
+            "expected outro aligned to best_fade_out_cuepoint (~230 s), got start={best_start_a_sec}, end={best_end_a_sec}"
+        );
+        assert!(
+            best_start_b_sec <= 20.0,
+            "expected intro best_fade_in_cuepoint (~16 s), got start_b_sec={best_start_b_sec}"
+        );
     }
 }
