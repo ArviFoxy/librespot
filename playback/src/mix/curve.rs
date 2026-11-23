@@ -530,4 +530,59 @@ mod tests {
         };
         assert!((apply_semantics(50.0, &pct_sem).as_linear_gain().unwrap() - 0.5).abs() < 1e-12);
     }
+
+    #[test]
+    fn cubic_bezier_and_zero_span_handle_pathological_and_non_finite_inputs() {
+        // 1. Vertical start/end tangents + chained 7-point (2-segment) cubic Bézier.
+        let chained = AutomationCurve::cubic_bezier(
+            vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 0.0, y: 0.8 },
+                CurvePoint { x: 0.5, y: 0.2 },
+                CurvePoint { x: 0.5, y: 1.0 },
+                CurvePoint { x: 0.5, y: 0.8 },
+                CurvePoint { x: 1.0, y: 0.2 },
+                CurvePoint { x: 1.0, y: 0.0 },
+            ],
+            0.0,
+            1.0,
+        );
+        for i in 0..=200 {
+            let u = i as f64 / 200.0;
+            let v = eval_curve(&chained, u).expect("valid u must evaluate");
+            assert!(
+                v.is_finite() && (-0.01..=1.01).contains(&v),
+                "unexpected value at u={u}: {v}"
+            );
+        }
+        assert!(eval_curve(&chained, 0.0).unwrap().abs() < 1e-12);
+        assert!((eval_curve(&chained, 0.5).unwrap() - 1.0).abs() < 1e-12);
+        assert!(eval_curve(&chained, 1.0).unwrap().abs() < 1e-12);
+
+        // 2. Non-finite inputs return None rather than poisoning downstream DSP.
+        let curves = AutomationCurves {
+            curves: vec![chained],
+            minimum: 0.0,
+            maximum: 1.0,
+        };
+        assert!(eval_curves(&curves, f64::NAN).is_none());
+        assert!(eval_curves(&curves, f64::INFINITY).is_none());
+        assert!(eval_curves(&curves, f64::NEG_INFINITY).is_none());
+
+        // 3. Zero-span segment at [0.5, 0.5] must NOT shadow segments covering [0.0, 0.5).
+        let with_zero_span = AutomationCurves {
+            curves: vec![
+                AutomationCurve::linear(vec![CurvePoint { x: 0.5, y: 0.9 }], 0.5, 0.5),
+                AutomationCurve::linear(
+                    vec![CurvePoint { x: 0.0, y: 0.1 }, CurvePoint { x: 1.0, y: 0.1 }],
+                    0.0,
+                    1.0,
+                ),
+            ],
+            minimum: 0.0,
+            maximum: 1.0,
+        };
+        assert!((eval_curves(&with_zero_span, 0.0).unwrap() - 0.1).abs() < 1e-12);
+        assert!((eval_curves(&with_zero_span, 0.5).unwrap() - 0.9).abs() < 1e-12);
+    }
 }

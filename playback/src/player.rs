@@ -3933,4 +3933,50 @@ mod tests {
             "post-mix steady peak {steady_peak_db:.2} dBFS exceeded limiter ceiling"
         );
     }
+
+    #[cfg(feature = "mix-transitions")]
+    #[test]
+    fn transition_safety_limiter_prevents_clipping_when_normalisation_is_off_or_basic() {
+        for (normalisation, method) in [
+            (false, NormalisationMethod::Dynamic),
+            (true, NormalisationMethod::Basic),
+        ] {
+            let config = PlayerConfig {
+                normalisation,
+                normalisation_method: method,
+                ..Default::default()
+            };
+            let n_frames = SAMPLE_RATE as usize / 2;
+            let mut mixed = vec![0.0_f64; n_frames * 2];
+            for i in 0..n_frames {
+                let s = 2.0
+                    * (2.0 * std::f64::consts::PI * 100.0 * i as f64 / f64::from(SAMPLE_RATE))
+                        .sin();
+                mixed[2 * i] = s;
+                mixed[2 * i + 1] = s;
+            }
+            let mut limiter = MasterLimiter::new(&config);
+            limiter.process_transition_post_mix(&mut mixed, &config, 1.0);
+            assert!(mixed.iter().all(|s| s.is_finite()));
+            let settle = (SAMPLE_RATE as usize / 50) * 2; // 20 ms
+            let peak = mixed[settle..]
+                .iter()
+                .fold(0.0_f64, |acc, &s| acc.max(s.abs()));
+            assert!(
+                peak <= 1.0,
+                "transition safety limiter clipped with norm={normalisation} method={method:?}: peak={peak:.4}"
+            );
+
+            // Below -1 dBFS (~0.5), safety limiter must be completely transparent (unity pass-through).
+            let mut quiet = vec![0.5_f64; 1024];
+            let mut limiter_q = MasterLimiter::new(&config);
+            limiter_q.process_transition_post_mix(&mut quiet, &config, 1.0);
+            for &s in &quiet {
+                assert!(
+                    (s - 0.5).abs() < 1e-12,
+                    "safety limiter altered quiet audio: {s}"
+                );
+            }
+        }
+    }
 }

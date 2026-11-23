@@ -588,4 +588,285 @@ mod tests {
             assert!(y[0].abs() < 20.0 && y[1].abs() < 20.0);
         }
     }
+
+    /// Measure steady-state gain in dB of an arbitrary stereo filter at `freq_hz` after settling.
+    fn steady_state_gain_db<F>(freq_hz: f64, mut process_sample: F) -> f64
+    where
+        F: FnMut([f64; 2]) -> [f64; 2],
+    {
+        let fs = f64::from(SAMPLE_RATE);
+        let settle = 4096usize;
+        let measure = 4096usize;
+        let mut sum_in2 = 0.0_f64;
+        let mut sum_out2 = 0.0_f64;
+        for i in 0..(settle + measure) {
+            let x = (2.0 * PI * freq_hz * i as f64 / fs).sin();
+            let y = process_sample([x, x]);
+            if i >= settle {
+                sum_in2 += x * x;
+                sum_out2 += y[0] * y[0];
+            }
+        }
+        let ratio = (sum_out2 / sum_in2.max(1e-18)).sqrt().max(1e-12);
+        20.0 * ratio.log10()
+    }
+
+    #[test]
+    fn lr4_3band_isolator_analytical_crossovers_slopes_and_per_band_accuracy() {
+        let n = 16_384;
+        // 1. All-pass unity sum across 15 log-spaced frequencies (25 Hz..18 kHz).
+        let mut eq = LinkwitzRiley3Band::new(250.0, 2500.0);
+        let mut ir_unity = vec![0.0; n];
+        for (i, slot) in ir_unity.iter_mut().enumerate() {
+            let x = if i == 0 { 1.0 } else { 0.0 };
+            *slot = eq.process([x, x], [1.0, 1.0, 1.0])[0];
+        }
+        for &f in &[
+            25.0, 50.0, 100.0, 180.0, 250.0, 400.0, 700.0, 1200.0, 2000.0, 2500.0, 4000.0, 7000.0,
+            10_000.0, 14_000.0, 18_000.0,
+        ] {
+            let db = dft_mag_db(&ir_unity, f);
+            assert!(db.abs() < 0.05, "LR4 unity deviated at {f} Hz: {db:.4} dB");
+        }
+
+        // 2. Solo each band and verify exact -6.02 dB crossover points and 24 dB/oct rolloff.
+        let solo_ir = |gains: [f64; 3]| -> Vec<f64> {
+            let mut e = LinkwitzRiley3Band::new(250.0, 2500.0);
+            for _ in 0..4096 {
+                e.process([0.0, 0.0], gains);
+            }
+            let mut ir = vec![0.0; n];
+            for (i, slot) in ir.iter_mut().enumerate() {
+                let x = if i == 0 { 1.0 } else { 0.0 };
+                *slot = e.process([x, x], gains)[0];
+            }
+            ir
+        };
+        let ir_low = solo_ir([1.0, 0.0, 0.0]);
+        let ir_mid = solo_ir([0.0, 1.0, 0.0]);
+        let ir_high = solo_ir([0.0, 0.0, 1.0]);
+
+        // LR4 crossover points are exactly -6.02 dB.
+        assert!((dft_mag_db(&ir_low, 250.0) - (-6.02)).abs() < 0.2);
+        assert!((dft_mag_db(&ir_mid, 250.0) - (-6.02)).abs() < 0.2);
+        assert!((dft_mag_db(&ir_mid, 2500.0) - (-6.02)).abs() < 0.2);
+        assert!((dft_mag_db(&ir_high, 2500.0) - (-6.02)).abs() < 0.2);
+
+        // 24 dB/oct stopband slopes (2 octaves past crossover <= -44 dB).
+        assert!(dft_mag_db(&ir_low, 1000.0) < -44.0);
+        assert!(dft_mag_db(&ir_mid, 62.5) < -44.0);
+        assert!(dft_mag_db(&ir_mid, 10_000.0) < -44.0);
+        assert!(dft_mag_db(&ir_high, 625.0) < -44.0);
+
+        // 3. Per-band boost/cut accuracy against the exact analytical LR4 sum
+        //    |g_low * H_lp(f) + g_mid * H_hp(f)*H_lp2(f) + g_high * H_hp(f)*H_hp2(f)|.
+        for &(band_idx, center_hz, target_db) in &[
+            (0usize, 60.0_f64, 6.0_f64),
+            (0, 60.0, -12.0),
+            (1, 800.0, 6.0),
+            (1, 800.0, -12.0),
+            (2, 10_000.0, 6.0),
+            (2, 10_000.0, -12.0),
+        ] {
+            let mut gains = [1.0, 1.0, 1.0];
+            gains[band_idx] = 10.0_f64.powf(target_db / 20.0);
+            let h_lp1 = 1.0 / (1.0 + (center_hz / 250.0).powi(4));
+            let h_hp1 = 1.0 - h_lp1;
+            let h_lp2 = 1.0 / (1.0 + (center_hz / 2500.0).powi(4));
+            let h_hp2 = 1.0 - h_lp2;
+            let expected_mag =
+                gains[0] * h_lp1 + gains[1] * h_hp1 * h_lp2 + gains[2] * h_hp1 * h_hp2;
+            let expected_db = 20.0 * expected_mag.log10();
+
+            let mut e = LinkwitzRiley3Band::new(250.0, 2500.0);
+            let measured = steady_state_gain_db(center_hz, |f| e.process(f, gains));
+            assert!(
+                (measured - expected_db).abs() < 0.2,
+                "LR4 band {band_idx} at {center_hz} Hz expected {expected_db:.2} dB got {measured:.2} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn tpt_shelving_analytical_gains_and_boost_cut_complementarity() {
+        // 1. Exact steady-state gain accuracy for low shelf (30 Hz), mid bell (1 kHz), high shelf (14 kHz).
+        for &(band_idx, probe_hz, target_db) in &[
+            (0, 30.0, 6.0_f64),
+            (0, 30.0, -12.0),
+            (0, 30.0, -24.0),
+            (1, 1000.0, 6.0),
+            (1, 1000.0, -12.0),
+            (2, 14_000.0, 6.0),
+            (2, 14_000.0, -12.0),
+        ] {
+            let mut gains = [1.0, 1.0, 1.0];
+            gains[band_idx] = 10.0_f64.powf(target_db / 20.0);
+            let mut eq = TptShelving3Band::new(200.0, 1000.0, 4000.0);
+            let measured = steady_state_gain_db(probe_hz, |f| eq.process_linear_gains(f, gains));
+            assert!(
+                (measured - target_db).abs() < 0.6,
+                "TPT shelf band {band_idx} at {probe_hz} Hz target {target_db} dB got {measured:.2} dB"
+            );
+        }
+
+        // 2. Complementarity law: cascading +G dB followed by -G dB restores 0 dB across the spectrum.
+        let boost = [2.0, 2.0, 2.0]; // +6.02 dB
+        let cut = [0.5, 0.5, 0.5]; // -6.02 dB
+        for &f in &[40.0, 150.0, 400.0, 1000.0, 3000.0, 8000.0, 14_000.0] {
+            let mut eq_a = TptShelving3Band::new(200.0, 1000.0, 4000.0);
+            let mut eq_b = TptShelving3Band::new(200.0, 1000.0, 4000.0);
+            let db = steady_state_gain_db(f, |x| {
+                let y = eq_a.process_linear_gains(x, boost);
+                eq_b.process_linear_gains(y, cut)
+            });
+            assert!(
+                db.abs() < 0.15,
+                "TPT shelving +6/-6 complementarity failed at {f} Hz: {db:.4} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn deck_filter_analytical_lp_hp_resonance_bypass_freeze_and_mode_flip() {
+        let butterworth_q = std::f64::consts::FRAC_1_SQRT_2;
+
+        // 1. Settled 2-pole Butterworth LowPass at 1 kHz: -3.01 dB at fc, 12 dB/oct stopband.
+        let mut lp = DeckFilter::new();
+        let lp_pass = steady_state_gain_db(100.0, |x| {
+            lp.process(x, FilterMode::LowPass, 1000.0, butterworth_q)
+        });
+        let lp_fc = steady_state_gain_db(1000.0, |x| {
+            lp.process(x, FilterMode::LowPass, 1000.0, butterworth_q)
+        });
+        let lp_2x = steady_state_gain_db(2000.0, |x| {
+            lp.process(x, FilterMode::LowPass, 1000.0, butterworth_q)
+        });
+        let lp_4x = steady_state_gain_db(4000.0, |x| {
+            lp.process(x, FilterMode::LowPass, 1000.0, butterworth_q)
+        });
+        assert!(lp_pass.abs() < 0.15, "LP passband={lp_pass:.2} dB");
+        assert!((lp_fc - (-3.01)).abs() < 0.2, "LP fc={lp_fc:.2} dB");
+        assert!((lp_2x - (-12.3)).abs() < 0.5, "LP 2*fc={lp_2x:.2} dB");
+        assert!((lp_4x - (-24.1)).abs() < 0.8, "LP 4*fc={lp_4x:.2} dB");
+
+        // 2. Settled 2-pole Butterworth HighPass at 1 kHz: symmetric response.
+        let mut hp = DeckFilter::new();
+        let hp_pass = steady_state_gain_db(8000.0, |x| {
+            hp.process(x, FilterMode::HighPass, 1000.0, butterworth_q)
+        });
+        let hp_fc = steady_state_gain_db(1000.0, |x| {
+            hp.process(x, FilterMode::HighPass, 1000.0, butterworth_q)
+        });
+        let hp_half = steady_state_gain_db(500.0, |x| {
+            hp.process(x, FilterMode::HighPass, 1000.0, butterworth_q)
+        });
+        assert!(hp_pass.abs() < 0.15, "HP passband={hp_pass:.2} dB");
+        assert!((hp_fc - (-3.01)).abs() < 0.2, "HP fc={hp_fc:.2} dB");
+        assert!((hp_half - (-12.3)).abs() < 0.5, "HP fc/2={hp_half:.2} dB");
+
+        // 3. Exact resonant peak law: at Q = 4.0, |H_LP(fc)| ~= +12.04 dB.
+        let mut res = DeckFilter::new();
+        let peak_db =
+            steady_state_gain_db(1000.0, |x| res.process(x, FilterMode::LowPass, 1000.0, 4.0));
+        assert!(
+            (peak_db - 20.0 * 4.0_f64.log10()).abs() < 0.4,
+            "resonant peak at Q=4 got {peak_db:.2} dB"
+        );
+
+        // 4. Bypass cutoff-freeze regression: engaging LP wide open at 18 kHz and then switching
+        // to Bypass with dummy cutoff 1000 Hz must NOT pull 6 kHz down during the 10 ms fade-out.
+        let fs = f64::from(SAMPLE_RATE);
+        let mut bf = DeckFilter::new();
+        for i in 0..4096 {
+            let s = (2.0 * PI * 6000.0 * i as f64 / fs).sin();
+            bf.process([s, s], FilterMode::LowPass, 18_000.0, butterworth_q);
+        }
+        let mut min_env = 1.0_f64;
+        let mut win_sum = 0.0_f64;
+        for i in 0..2048 {
+            let s = (2.0 * PI * 6000.0 * (4096 + i) as f64 / fs).sin();
+            let y = bf.process([s, s], FilterMode::Bypass, 1000.0, butterworth_q);
+            win_sum += y[0] * y[0];
+            if (i + 1) % 128 == 0 {
+                let rms = (win_sum / 128.0).sqrt();
+                min_env = min_env.min(rms / std::f64::consts::FRAC_1_SQRT_2);
+                win_sum = 0.0;
+            }
+        }
+        assert!(
+            min_env > 0.85,
+            "bypass fade pulled 18 kHz LP down toward dummy 1 kHz cutoff (min_env={min_env:.3})"
+        );
+
+        // 5. Abrupt LowPass -> HighPass mode flip must crossfade through dry without a step click.
+        let mut mf = DeckFilter::new();
+        let mut prev = 0.0_f64;
+        let mut max_step = 0.0_f64;
+        for i in 0..6000 {
+            let t = i as f64 / fs;
+            let s = 0.5 * (2.0 * PI * 120.0 * t).sin() + 0.3 * (2.0 * PI * 2000.0 * t).sin();
+            let mode = if i < 2000 {
+                FilterMode::LowPass
+            } else {
+                FilterMode::HighPass
+            };
+            let y = mf.process([s, s], mode, 500.0, butterworth_q);
+            if i > 100 {
+                max_step = max_step.max((y[0] - prev).abs());
+            }
+            prev = y[0];
+        }
+        assert!(
+            max_step < 0.12,
+            "abrupt LP->HP mode flip produced step click: max_step={max_step:.4}"
+        );
+    }
+
+    #[test]
+    fn all_filters_stereo_independence_and_adversarial_edge_cases() {
+        let fs = f64::from(SAMPLE_RATE);
+
+        // 1. Stereo channel independence: signal on Left only must leak exact 0.0 to Right.
+        let mut lr4 = LinkwitzRiley3Band::new(250.0, 2500.0);
+        let mut tpt = TptShelving3Band::new(200.0, 1000.0, 4000.0);
+        let mut flt = DeckFilter::new();
+        for i in 0..1024 {
+            let s = (2.0 * PI * 330.0 * i as f64 / fs).sin();
+            let y1 = lr4.process([s, 0.0], [0.2, 1.5, 0.7]);
+            let y2 = tpt.process_linear_gains([s, 0.0], [0.2, 1.5, 0.7]);
+            let y3 = flt.process([s, 0.0], FilterMode::LowPass, 800.0, 2.5);
+            assert_eq!(y1[1], 0.0, "LR4 leaked L->R");
+            assert_eq!(y2[1], 0.0, "TPT shelving leaked L->R");
+            assert_eq!(y3[1], 0.0, "DeckFilter leaked L->R");
+        }
+
+        // 2. Adversarial NaN/Inf/subnormal/extreme parameters must never poison filter state.
+        let mut lr4 = LinkwitzRiley3Band::new(250.0, 2500.0);
+        let mut tpt = TptShelving3Band::new(-50.0, 1e9, f64::NAN);
+        let mut flt = DeckFilter::new();
+        let nasty_frames = [
+            [f64::NAN, f64::INFINITY],
+            [f64::NEG_INFINITY, 1e-300],
+            [-1e-300, 10.0],
+            [0.0, -10.0],
+        ];
+        for &frame in &nasty_frames {
+            let y1 = lr4.process(frame, [f64::NAN, f64::INFINITY, -5.0]);
+            let y2 = tpt.process_linear_gains(frame, [f64::NAN, 0.0, f64::INFINITY]);
+            let y3 = flt.process(frame, FilterMode::HighPass, f64::NAN, f64::INFINITY);
+            assert!(y1[0].is_finite() && y1[1].is_finite());
+            assert!(y2[0].is_finite() && y2[1].is_finite());
+            assert!(y3[0].is_finite() && y3[1].is_finite());
+        }
+        // Verify clean recovery on normal sine wave afterwards.
+        for i in 0..512 {
+            let s = 0.5 * (2.0 * PI * 440.0 * i as f64 / fs).sin();
+            let y1 = lr4.process([s, s], [1.0, 1.0, 1.0]);
+            let y2 = tpt.process_linear_gains([s, s], [1.0, 1.0, 1.0]);
+            let y3 = flt.process([s, s], FilterMode::LowPass, 2000.0, 0.707);
+            assert!(y1[0].is_finite() && y1[0].abs() < 5.0);
+            assert!(y2[0].is_finite() && y2[0].abs() < 5.0);
+            assert!(y3[0].is_finite() && y3[0].abs() < 5.0);
+        }
+    }
 }

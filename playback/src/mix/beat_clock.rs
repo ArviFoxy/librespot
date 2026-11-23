@@ -426,4 +426,55 @@ mod tests {
         let clock_live = BeatClock::new(0, 0, 0, Some(32.0), Some(&live_plan));
         assert!(clock_live.needs_time_stretch());
     }
+
+    #[test]
+    fn octave_folded_beat_grids_keep_ratios_and_expected_frames_at_1x() {
+        let make_grid = |bpm: f64, count: usize| BeatGrid {
+            beats_per_bar: 4,
+            beats: (0..count)
+                .map(|i| super::super::spec::BeatMarker {
+                    time_sec: i as f64 * 60.0 / bpm,
+                    duration_sec: 60.0 / bpm,
+                    beat_in_bar: (i as u32 % 4) + 1,
+                    beat_confidence: 0.9,
+                    downbeat_confidence: 0.9,
+                })
+                .collect(),
+        };
+
+        // 1. Track A at 174 BPM (174 BPM grid) -> Track B at 88 BPM half-time (88 BPM grid, folded 176 BPM).
+        let mut plan = TempoPlan::beatmatched(174.0, 88.0);
+        plan.beats_a = Some(make_grid(174.0, 80));
+        plan.beats_b = Some(make_grid(88.0, 80));
+        let mut clock = BeatClock::new(0, 0, 0, Some(32.0), Some(&plan));
+        assert!(clock.needs_time_stretch());
+
+        // Advance 16 beats (~5.5 s): ratios must stay near 1.0x (never 2.0x!), and expected
+        // Track B frame must advance by ~5.45 s (~240k frames), never 2x (~10.9 s).
+        clock.beat_pos = 16.0;
+        let (ra, rb) = clock.deck_ratios();
+        assert!((ra - 175.0 / 174.0).abs() < 0.01, "ra={ra}");
+        assert!((rb - 175.0 / 176.0).abs() < 0.01, "rb={rb}");
+        let (fa, fb) = clock.expected_source_frames();
+        let sec_a = fa / f64::from(SAMPLE_RATE);
+        let sec_b = fb / f64::from(SAMPLE_RATE);
+        assert!((sec_a - 16.0 * 60.0 / 174.0).abs() < 0.02, "sec_a={sec_a}");
+        assert!((sec_b - 16.0 * 60.0 / 176.0).abs() < 0.02, "sec_b={sec_b}");
+
+        // 2. Half-time Track A grid (87 BPM grid) with nominal 174 BPM must stay near 1.0x, never 2.0x.
+        let mut plan_ht_a = TempoPlan::beatmatched(174.0, 174.0);
+        plan_ht_a.beats_a = Some(make_grid(87.0, 80));
+        plan_ht_a.beats_b = Some(make_grid(174.0, 80));
+        let mut clock_ht_a = BeatClock::new(0, 0, 0, Some(32.0), Some(&plan_ht_a));
+        clock_ht_a.beat_pos = 16.0;
+        let (ra2, rb2) = clock_ht_a.deck_ratios();
+        assert!((ra2 - 1.0).abs() < 1e-6, "half-time beats_a gave ra={ra2}");
+        assert!((rb2 - 1.0).abs() < 1e-6, "rb={rb2}");
+        let (fa2, _) = clock_ht_a.expected_source_frames();
+        let sec_a2 = fa2 / f64::from(SAMPLE_RATE);
+        assert!(
+            (sec_a2 - 16.0 * 60.0 / 174.0).abs() < 0.02,
+            "half-time beats_a drifted: sec_a2={sec_a2}"
+        );
+    }
 }

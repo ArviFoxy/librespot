@@ -1320,4 +1320,166 @@ mod tests {
             "identity-BPM passthrough inflated peak: {peak}"
         );
     }
+
+    #[test]
+    fn non_stretched_simple_fade_exit_handoff_skips_zero_frames() {
+        // Regression test: when `stretch_mode == Off`, `has_eq == false`, `has_filter == false`
+        // (e.g. SimpleFade / SimpleCut / non-beatmatched fallback), exit handoff must NOT drop
+        // 882 frames (~20 ms) of Deck B between transition output and `drain_deck_b_continuation()`.
+        let fs = f64::from(SAMPLE_RATE);
+        let n_frames = SAMPLE_RATE as usize * 3;
+        let mut a = vec![0.0_f64; n_frames * CHANNELS];
+        let mut b = vec![0.0_f64; n_frames * CHANNELS];
+        for i in 0..n_frames {
+            let t = i as f64 / fs;
+            let sa = 0.4 * (2.0 * PI * 330.0 * t).sin();
+            let sb = 0.4 * (2.0 * PI * 220.0 * t).sin();
+            a[2 * i] = sa;
+            a[2 * i + 1] = sa;
+            b[2 * i] = sb;
+            b[2 * i + 1] = sb;
+        }
+
+        let spec = TransitionSpec::equal_power_crossfade(0, 0, SAMPLE_RATE as u64);
+        let mut proc = TransitionProcessor::new(spec);
+        let mut pos_a = 0usize;
+        let mut pos_b = 0usize;
+        let mut out = Vec::new();
+        let feed_chunk = 1024 * CHANNELS;
+
+        while !proc.is_complete() {
+            while proc.needs_deck_a_input() && pos_a < a.len() {
+                let end = (pos_a + feed_chunk).min(a.len());
+                proc.push_deck_a(&a[pos_a..end]);
+                pos_a = end;
+            }
+            while proc.needs_deck_b_input() && pos_b < b.len() {
+                let end = (pos_b + feed_chunk).min(b.len());
+                proc.push_deck_b(&b[pos_b..end]);
+                pos_b = end;
+            }
+            let wrote = proc.render(512, &mut out);
+            if wrote == 0 && pos_a >= a.len() && pos_b >= b.len() {
+                break;
+            }
+        }
+        assert!(proc.is_complete());
+
+        let pushed_b_frames = (pos_b / CHANNELS) as u64;
+        let rendered_frames = (out.len() / CHANNELS) as u64;
+        let (next_frame, continuation) = proc.drain_deck_b_continuation();
+        let cont_frames = (continuation.len() / CHANNELS) as u64;
+
+        assert_eq!(
+            next_frame, rendered_frames,
+            "non-stretched exit skipped frames: rendered={rendered_frames}, next_frame={next_frame}"
+        );
+        assert_eq!(
+            next_frame + cont_frames,
+            pushed_b_frames,
+            "continuation frame accounting mismatch"
+        );
+        // Zero click at the exact exit splice between last rendered frame and first dry frame.
+        let splice_step = (continuation[0] - out[out.len() - 2]).abs();
+        assert!(
+            splice_step < 0.03,
+            "step click at non-stretched exit splice: {splice_step:.5}"
+        );
+    }
+
+    #[test]
+    fn all_topologies_and_stretch_modes_handle_degenerate_and_abort_transitions() {
+        let fs = f64::from(SAMPLE_RATE);
+        let n_frames = SAMPLE_RATE as usize * 2;
+        let mut a = vec![0.0_f64; n_frames * CHANNELS];
+        let mut b = vec![0.0_f64; n_frames * CHANNELS];
+        for i in 0..n_frames {
+            let t = i as f64 / fs;
+            let sa = 0.4 * (2.0 * PI * 180.0 * t).sin();
+            let sb = 0.4 * (2.0 * PI * 270.0 * t).sin();
+            a[2 * i] = sa;
+            a[2 * i + 1] = sa;
+            b[2 * i] = sb;
+            b[2 * i + 1] = sb;
+        }
+
+        let topologies = [
+            super::super::spec::EqTopology::TptShelving {
+                low_hz: 200.0,
+                mid_hz: 1000.0,
+                high_hz: 4000.0,
+            },
+            super::super::spec::EqTopology::LinkwitzRileyIsolator {
+                low_hz: 250.0,
+                high_hz: 2500.0,
+            },
+        ];
+        let stretch_modes = [
+            TimeStretchMode::Off,
+            TimeStretchMode::Varispeed,
+            TimeStretchMode::PitchPreserving,
+        ];
+
+        // 1. Degenerate/short durations (0, 1, 64 frames) and early Deck A/B EOF across all modes.
+        for &topo in &topologies {
+            for &mode in &stretch_modes {
+                for &dur in &[0_u64, 1, 64] {
+                    let mut spec = TransitionSpec::equal_power_crossfade(0, 0, dur);
+                    spec.eq_topology = topo;
+                    if mode != TimeStretchMode::Off {
+                        let mut plan = TempoPlan::beatmatched(126.0, 128.0);
+                        plan.stretch_mode = mode;
+                        spec.tempo = Some(plan);
+                    }
+                    let out = run_offline(spec, &a[..2048 * CHANNELS], &b[..2048 * CHANNELS]);
+                    assert!(
+                        out.iter().all(|s| s.is_finite()),
+                        "non-finite sample for topo={topo:?} mode={mode:?} dur={dur}"
+                    );
+                }
+
+                // Immediate empty Deck A / Deck B EOF must complete without hanging.
+                let mut spec_eof = TransitionSpec::equal_power_crossfade(0, 0, 2048);
+                spec_eof.eq_topology = topo;
+                let out_eof = run_offline(spec_eof, &[], &b[..1024 * CHANNELS]);
+                assert!(out_eof.iter().all(|s| s.is_finite()));
+            }
+        }
+
+        // 2. Abort fade triggered right inside ExitBlend must still fade cleanly to silence.
+        let mut spec = TransitionSpec::equal_power_crossfade(0, 0, 2048);
+        spec.in_curves.eq_low = Some(AutomationCurves {
+            curves: vec![AutomationCurve::linear(
+                vec![CurvePoint { x: 0.0, y: 0.0 }, CurvePoint { x: 1.0, y: 1.0 }],
+                0.0,
+                1.0,
+            )],
+            minimum: 0.0,
+            maximum: 1.0,
+        });
+        let mut proc = TransitionProcessor::new(spec);
+        proc.push_deck_a(&a);
+        proc.push_deck_b(&b);
+        proc.set_deck_a_eof();
+        proc.set_deck_b_eof();
+        let mut out = Vec::new();
+        // Run just past beat-clock completion so we enter ExitBlend.
+        let _ = proc.render(2048 + 400, &mut out);
+        assert!(proc.exit_blend.is_some());
+        proc.begin_abort_fade();
+        let mut abort_out = Vec::new();
+        for _ in 0..16 {
+            if proc.is_complete() {
+                break;
+            }
+            let _ = proc.render(256, &mut abort_out);
+        }
+        assert!(proc.is_complete());
+        assert!(abort_out.len() >= ABORT_FADE_FRAMES * CHANNELS);
+        assert!(
+            abort_out[abort_out.len() - 2].abs() < 0.02,
+            "abort fade during ExitBlend did not reach silence: {}",
+            abort_out[abort_out.len() - 2]
+        );
+    }
 }

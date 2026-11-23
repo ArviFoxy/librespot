@@ -425,3 +425,152 @@ fn catmull_rom(y0: f64, y1: f64, y2: f64, y3: f64, t: f64) -> f64 {
     let a3 = y1;
     ((a0 * t + a1) * t + a2) * t + a3
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    /// Estimate the dominant frequency in `[f_min, f_max]` Hz via dense Goertzel/DFT scan.
+    fn dominant_freq_hz(mono: &[f64], f_min: f64, f_max: f64, step_hz: f64) -> f64 {
+        let fs = f64::from(SAMPLE_RATE);
+        let n = mono.len();
+        let mut best_f = f_min;
+        let mut best_mag2 = -1.0_f64;
+        let mut f = f_min;
+        while f <= f_max {
+            let w = 2.0 * PI * f / fs;
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for (i, &x) in mono.iter().enumerate() {
+                // Hann window suppresses spectral leakage.
+                let win = 0.5 * (1.0 - (2.0 * PI * i as f64 / n as f64).cos());
+                let xw = x * win;
+                let angle = w * i as f64;
+                re += xw * angle.cos();
+                im -= xw * angle.sin();
+            }
+            let mag2 = re * re + im * im;
+            if mag2 > best_mag2 {
+                best_mag2 = mag2;
+                best_f = f;
+            }
+            f += step_hz;
+        }
+        best_f
+    }
+
+    fn run_stretcher(mode: TimeStretchMode, ratio: f64, input: &[f64]) -> Vec<f64> {
+        let mut s = DeckStretcher::new(mode, 0, ratio);
+        s.push_samples(input);
+        s.set_eof();
+        let mut out = Vec::new();
+        for _ in 0..2000 {
+            if s.is_finished() {
+                break;
+            }
+            let wrote = s.render(512, &mut out);
+            if wrote == 0 && s.is_finished() {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pitch_preserving_preserves_pitch_while_varispeed_shifts_pitch() {
+        let fs = f64::from(SAMPLE_RATE);
+        let n_frames = SAMPLE_RATE as usize * 2;
+        let base_hz = 440.0;
+        let mut sine = Vec::with_capacity(n_frames * CHANNELS);
+        for i in 0..n_frames {
+            let x = 0.5 * (2.0 * PI * base_hz * i as f64 / fs).sin();
+            sine.push(x);
+            sine.push(x);
+        }
+
+        for &ratio in &[0.92_f64, 1.08_f64] {
+            let pp_out = run_stretcher(TimeStretchMode::PitchPreserving, ratio, &sine);
+            let vs_out = run_stretcher(TimeStretchMode::Varispeed, ratio, &sine);
+
+            let take_mid_mono = |buf: &[f64]| -> Vec<f64> {
+                let frames = buf.len() / CHANNELS;
+                let start = frames / 3;
+                let len = 8192.min(frames.saturating_sub(start));
+                (0..len).map(|i| buf[(start + i) * CHANNELS]).collect()
+            };
+
+            let pp_freq = dominant_freq_hz(&take_mid_mono(&pp_out), 380.0, 500.0, 1.0);
+            let vs_freq = dominant_freq_hz(&take_mid_mono(&vs_out), 380.0, 500.0, 1.0);
+
+            assert!(
+                (pp_freq - base_hz).abs() <= 7.0,
+                "PitchPreserving at {ratio}x drifted pitch: expected ~{base_hz} Hz, got {pp_freq} Hz"
+            );
+            let expected_vs = base_hz * ratio;
+            assert!(
+                (vs_freq - expected_vs).abs() <= 7.0,
+                "Varispeed at {ratio}x wrong pitch: expected ~{expected_vs:.1} Hz, got {vs_freq} Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn stretcher_preserves_stereo_panning_and_handles_dynamic_ramp_and_nan() {
+        let fs = f64::from(SAMPLE_RATE);
+        let n_frames = SAMPLE_RATE as usize;
+        let mut left_only = Vec::with_capacity(n_frames * CHANNELS);
+        for i in 0..n_frames {
+            let x = 0.5 * (2.0 * PI * 330.0 * i as f64 / fs).sin();
+            left_only.push(x);
+            left_only.push(0.0);
+        }
+
+        for mode in [
+            TimeStretchMode::Off,
+            TimeStretchMode::Varispeed,
+            TimeStretchMode::PitchPreserving,
+        ] {
+            let out = run_stretcher(mode, 1.05, &left_only);
+            let mut l2 = 0.0;
+            let mut r2 = 0.0;
+            for f in out.chunks_exact(CHANNELS) {
+                assert!(f[0].is_finite() && f[1].is_finite());
+                l2 += f[0] * f[0];
+                r2 += f[1] * f[1];
+            }
+            assert!(l2 > 1.0, "{mode:?} produced empty Left channel");
+            let bleed_db = 10.0 * (r2 / l2).max(1e-18).log10();
+            assert!(
+                bleed_db < -25.0,
+                "{mode:?} leaked Left-only signal into Right: {bleed_db:.1} dB"
+            );
+        }
+
+        // Dynamic ramp + NaN/Inf resilience.
+        let mut s = DeckStretcher::new(TimeStretchMode::PitchPreserving, 1000, f64::NAN);
+        let mut bad_chunk = left_only.clone();
+        bad_chunk[100] = f64::NAN;
+        bad_chunk[101] = f64::INFINITY;
+        s.push_samples(&bad_chunk);
+        s.set_eof();
+        let mut out = Vec::new();
+        let mut prev_pos = s.current_source_frame();
+        for step in 0..200 {
+            if step == 5 {
+                s.set_ratio(f64::NAN);
+            } else {
+                let r = 0.94 + 0.12 * (step as f64 / 200.0);
+                s.set_ratio(r);
+            }
+            let _ = s.render(256, &mut out);
+            assert!(s.current_source_frame() >= prev_pos - 1e-6);
+            prev_pos = s.current_source_frame();
+            if s.is_finished() {
+                break;
+            }
+        }
+        assert!(s.is_finished());
+        assert!(out.iter().all(|x| x.is_finite()));
+    }
+}
