@@ -14,12 +14,16 @@ use crate::{
     core::{Session, SpotifyId, SpotifyUri},
     mix::{
         MixConfig, MixMode,
-        presets::{BuiltinPreset, curves_for_builtin_preset, curves_from_proto_preset},
+        presets::{
+            BuiltinPreset, bipolar_eq_semantics, bipolar_resonance_semantics,
+            curves_for_builtin_preset, curves_from_proto_preset,
+        },
     },
     playback::{
         SAMPLE_RATE,
         mix::{
-            BeatGrid, BeatMarker, TempoPlan, TimeStretchMode, TransitionSpec,
+            AutomationCurve, AutomationCurves, BeatGrid, BeatMarker, CurveInterpolation,
+            CurvePoint, DeckCurves, TempoPlan, TimeStretchMode, TransitionSpec,
             beat_clock::fold_bpm_octave,
         },
     },
@@ -133,18 +137,26 @@ pub fn context_signals_mixed(
         }) || m
             .get("is_mixed")
             .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            || m.get("mixer_enabled")
+                .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
     };
 
     if modes.is_some_and(map_is_mixed) || context_metadata.is_some_and(map_is_mixed) {
         return true;
     }
 
-    let has_recipe = |t: &ProvidedTrack| {
+    let has_track_mix_data = |t: &ProvidedTrack| {
         RECIPE_METADATA_KEYS
             .iter()
             .any(|k| t.metadata.get(*k).is_some_and(|v| !v.is_empty()))
+            || t.metadata
+                .get("audio.fade_out_start_time")
+                .is_some_and(|v| !v.is_empty())
+            || t.metadata
+                .get("audio.fade_in_start_time")
+                .is_some_and(|v| !v.is_empty())
     };
-    current_track.is_some_and(has_recipe) || next_track.is_some_and(has_recipe)
+    current_track.is_some_and(has_track_mix_data) || next_track.is_some_and(has_track_mix_data)
 }
 
 /// Decode a base64-encoded `spotify.automix.proto.Transition` (`transition_recipe`).
@@ -301,13 +313,35 @@ pub fn transition_proto_to_spec(
         BeatmatchPreference::BEATMATCH_PREFERENCE_AUTO => overlap.is_beatmatched,
     };
 
+    let scale_bpm = |raw: f64, speed_opt: Option<f32>, item_speed: f64| -> f64 {
+        let mut s = 1.0;
+        if let Some(sp) = speed_opt {
+            let sp = f64::from(sp);
+            if sp.is_finite() && (0.5..=2.0).contains(&sp) {
+                s *= sp;
+            }
+        }
+        if item_speed.is_finite() && (0.5..=2.0).contains(&item_speed) {
+            s *= item_speed;
+        }
+        raw * s
+    };
+
     let bpm_a = if overlap.bpm_a > 20.0 {
-        Some(f64::from(overlap.bpm_a))
+        Some(scale_bpm(
+            f64::from(overlap.bpm_a),
+            overlap.speed_a,
+            overlap.item_speed_a,
+        ))
     } else {
         meta_a.bpm
     };
     let bpm_b = if overlap.bpm_b > 20.0 {
-        Some(f64::from(overlap.bpm_b))
+        Some(scale_bpm(
+            f64::from(overlap.bpm_b),
+            overlap.speed_b,
+            overlap.item_speed_b,
+        ))
     } else {
         meta_b.bpm
     };
@@ -347,6 +381,238 @@ pub fn transition_proto_to_spec(
         duration_frames: ms_to_frames(duration_ms),
         duration_beats,
         handoff_fraction,
+        tempo,
+        out_curves,
+        in_curves,
+        eq_topology: config.eq_topology,
+    })
+}
+
+/// Parse Spotify's `audio.fade_*` JSON curve array into protocol-agnostic [`AutomationCurves`].
+///
+/// Expected schema (as transferred on `ProvidedTrack.metadata`):
+/// `[{"start_point": 0.0, "end_point": 0.5, "fade_curve": [{"x": 0.0, "y": 1.0}, ...]}, ...]`.
+/// Two-point segments are piecewise linear; 4-point (and `3k + 1`-point) segments are cubic Bézier.
+pub fn parse_fade_json_curves(raw_json: &str) -> Option<AutomationCurves> {
+    let val: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+    let arr = val.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+
+    let mut curves = Vec::with_capacity(arr.len());
+    for seg in arr {
+        let start = seg.get("start_point")?.as_f64()?;
+        let end = seg.get("end_point")?.as_f64()?;
+        if !start.is_finite() || !end.is_finite() || end < start {
+            return None;
+        }
+        let pts_arr = seg.get("fade_curve")?.as_array()?;
+        if pts_arr.is_empty() {
+            continue;
+        }
+        let mut points = Vec::with_capacity(pts_arr.len());
+        for pt in pts_arr {
+            let x = pt.get("x")?.as_f64()?;
+            let y = pt.get("y")?.as_f64()?;
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            points.push(CurvePoint { x, y });
+        }
+        let interpolation = if points.len() >= 4 && (points.len() - 1) % 3 == 0 {
+            CurveInterpolation::CubicBezier
+        } else {
+            CurveInterpolation::Linear
+        };
+        curves.push(AutomationCurve {
+            points,
+            start,
+            end,
+            interpolation,
+        });
+    }
+
+    if curves.is_empty() {
+        return None;
+    }
+
+    Some(AutomationCurves {
+        curves,
+        minimum: 0.0,
+        maximum: 1.0,
+    })
+}
+
+fn parse_ms_meta(map: &HashMap<String, String>, key: &str) -> Option<u64> {
+    let raw = map.get(key)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<u64>().ok().or_else(|| {
+        raw.parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v.round() as u64)
+    })
+}
+
+fn parse_deck_fade_curves(map: &HashMap<String, String>, dir: &str) -> DeckCurves {
+    let key = |suffix: &str| format!("audio.fade_{dir}_{suffix}");
+    let mut deck = DeckCurves {
+        volume: map
+            .get(&key("curves"))
+            .and_then(|s| parse_fade_json_curves(s)),
+        eq_low: map
+            .get(&key("eq_low_gain_curves"))
+            .and_then(|s| parse_fade_json_curves(s)),
+        eq_mid: map
+            .get(&key("eq_mid_gain_curves"))
+            .and_then(|s| parse_fade_json_curves(s)),
+        eq_high: map
+            .get(&key("eq_high_gain_curves"))
+            .and_then(|s| parse_fade_json_curves(s)),
+        filter_cutoff: map
+            .get(&key("filter_cutoff_curves"))
+            .and_then(|s| parse_fade_json_curves(s)),
+        filter_resonance: map
+            .get(&key("filter_resonance_curves"))
+            .and_then(|s| parse_fade_json_curves(s)),
+        ..Default::default()
+    };
+
+    if deck.eq_low.is_some() || deck.eq_mid.is_some() || deck.eq_high.is_some() {
+        deck.eq_semantics = Some(bipolar_eq_semantics());
+    }
+    if deck.filter_resonance.is_some() {
+        deck.filter_resonance_semantics = Some(bipolar_resonance_semantics());
+    }
+    deck
+}
+
+/// Build a [`TransitionSpec`] from Spotify's pre-computed `audio.fade_*` track metadata
+/// (sent on `ProvidedTrack.metadata` during Connect playback transfer).
+///
+/// Enforces pair consistency via `audio.fade_out_uri` (when present) and `audio.fade_overlap`
+/// matching `audio.fade_out_duration` within 500 ms so manual queue insertions or reorders
+/// cleanly fall back to Auto DJ synthesis instead of applying stale curves to the wrong track.
+pub fn transition_from_fade_metadata(
+    track_a: TrackTransitionContext<'_>,
+    meta_a_map: &HashMap<String, String>,
+    track_b: TrackTransitionContext<'_>,
+    meta_b_map: &HashMap<String, String>,
+    config: &MixConfig,
+) -> Option<TransitionSpec> {
+    let start_a_ms = parse_ms_meta(meta_a_map, "audio.fade_out_start_time")?;
+    let fade_out_dur_ms = parse_ms_meta(meta_a_map, "audio.fade_out_duration")?;
+    if !(250..=45_000).contains(&fade_out_dur_ms) {
+        return None;
+    }
+
+    if let Some(target_uri) = meta_a_map.get("audio.fade_out_uri") {
+        if !target_uri.is_empty()
+            && !track_b.track_uri.is_empty()
+            && target_uri != track_b.track_uri
+        {
+            debug!(
+                "Skipping transferred fade metadata: audio.fade_out_uri mismatch ({target_uri} != {})",
+                track_b.track_uri
+            );
+            return None;
+        }
+    }
+
+    let fade_overlap_ms = parse_ms_meta(meta_b_map, "audio.fade_overlap");
+    let fade_in_dur_ms = parse_ms_meta(meta_b_map, "audio.fade_in_duration");
+    if fade_overlap_ms.is_none() && fade_in_dur_ms.is_none() {
+        return None;
+    }
+
+    if let Some(overlap_ms) = fade_overlap_ms {
+        if overlap_ms.abs_diff(fade_out_dur_ms) > 500 {
+            debug!(
+                "Skipping transferred fade metadata: fade_overlap ({overlap_ms} ms) != fade_out_duration ({fade_out_dur_ms} ms)"
+            );
+            return None;
+        }
+    }
+
+    let start_b_ms = parse_ms_meta(meta_b_map, "audio.fade_in_start_time").unwrap_or(0);
+    let fade_in_dur_ms =
+        fade_in_dur_ms.unwrap_or_else(|| fade_overlap_ms.unwrap_or(fade_out_dur_ms));
+    if !(250..=45_000).contains(&fade_in_dur_ms) {
+        return None;
+    }
+
+    let out_curves = parse_deck_fade_curves(meta_a_map, "out");
+    let in_curves = parse_deck_fade_curves(meta_b_map, "in");
+
+    let bpm_a = effective_bpm(track_a.meta);
+    let bpm_b = effective_bpm(track_b.meta);
+    let beatmatchable_genre = track_a.meta.beatmatchability.unwrap_or(1.0) >= 0.25
+        && track_b.meta.beatmatchability.unwrap_or(1.0) >= 0.25;
+
+    let (tempo, duration_beats, duration_ms) = match (bpm_a, bpm_b) {
+        (Some(ba), Some(bb)) if config.stretch_mode != TimeStretchMode::Off => {
+            let folded_b = fold_bpm_octave(ba, bb);
+            let bpm_ratio = (folded_b / ba).max(ba / folded_b);
+            let dur_ratio = fade_out_dur_ms as f64 / fade_in_dur_ms as f64;
+            let expected_dur_ratio = folded_b / ba;
+            let durations_match_bpm = fade_out_dur_ms != fade_in_dur_ms
+                && (dur_ratio / expected_dur_ratio - 1.0).abs() <= 0.06;
+            let same_bpm_beatmatched =
+                (ba - folded_b).abs() <= 0.75 && beatmatchable_genre && fade_out_dur_ms >= 4_000;
+
+            if bpm_ratio <= config.max_bpm_ratio.max(1.0)
+                && (durations_match_bpm || same_bpm_beatmatched || beatmatchable_genre)
+            {
+                let beats_per_bar = track_a
+                    .meta
+                    .beats
+                    .as_ref()
+                    .map(|g| g.beats_per_bar)
+                    .filter(|&b| b == 3 || b == 4)
+                    .unwrap_or(4);
+                let raw_beats = (fade_out_dur_ms as f64 / 1000.0) * ba / 60.0;
+                let nearest_bar_beats =
+                    (raw_beats / f64::from(beats_per_bar)).round() * f64::from(beats_per_bar);
+                let snapped_beats = if nearest_bar_beats >= f64::from(beats_per_bar)
+                    && (raw_beats - nearest_bar_beats).abs() <= 0.75
+                {
+                    Some(nearest_bar_beats)
+                } else if raw_beats >= 4.0 {
+                    Some(raw_beats.round())
+                } else {
+                    None
+                };
+
+                let avg_dur_ms = (fade_out_dur_ms + fade_in_dur_ms) / 2;
+                (
+                    Some(TempoPlan {
+                        bpm_a: ba,
+                        bpm_b: bb,
+                        beatmatched: true,
+                        max_bpm_ratio: config.max_bpm_ratio,
+                        beats_a: track_a.meta.beats.clone(),
+                        beats_b: track_b.meta.beats.clone(),
+                        stretch_mode: config.stretch_mode,
+                    }),
+                    snapped_beats,
+                    avg_dur_ms,
+                )
+            } else {
+                (None, None, fade_overlap_ms.unwrap_or(fade_out_dur_ms))
+            }
+        }
+        _ => (None, None, fade_overlap_ms.unwrap_or(fade_out_dur_ms)),
+    };
+
+    Some(TransitionSpec {
+        start_a_frame: ms_to_frames(start_a_ms),
+        start_b_frame: ms_to_frames(start_b_ms),
+        duration_frames: ms_to_frames(duration_ms),
+        duration_beats,
+        handoff_fraction: 0.5,
         tempo,
         out_curves,
         in_curves,
@@ -482,7 +748,8 @@ fn collect_out_cues(meta: &TrackMixMetadata, dur_a_sec: f64) -> Vec<(f64, f64)> 
         }
     }
     if out.is_empty() && dur_a_sec > 20.0 {
-        out.push(((dur_a_sec - 16.0).max(5.0), 0.3));
+        // Fallback fade-out END cue near track tail (`start_a = end_a - dur_sec`).
+        out.push(((dur_a_sec - 4.0).max(12.0), 0.3));
     }
     out
 }
@@ -580,15 +847,12 @@ pub fn synthesize_auto_transition(
         let bar_candidates: &[u32] = if key_tier >= 3 { &[4, 8] } else { &[8, 4, 16] };
 
         let mut best: Option<(f64, f64, f64, u32)> = None;
-        for &(raw_a, score_a) in &out_cues {
-            let start_a = meta_a
-                .beats
-                .as_ref()
-                .map(|g| snap_to_downbeat(g, raw_a, 1.5))
-                .unwrap_or(raw_a);
-            if start_a < 4.0 {
-                continue;
-            }
+        for &(raw_end_a, score_a) in &out_cues {
+            let end_a = if dur_a_sec > 0.0 {
+                raw_end_a.min(dur_a_sec)
+            } else {
+                raw_end_a
+            };
             for &(raw_b, score_b) in &in_cues {
                 let start_b = meta_b
                     .beats
@@ -600,7 +864,22 @@ pub fn synthesize_auto_transition(
                     if dur_sec > MAX_OVERLAP_SEC {
                         continue;
                     }
-                    if dur_a_sec > 0.0 && start_a + dur_sec > dur_a_sec + 0.5 {
+                    // Spotify `fade_out_cuepoint` marks the END of Track A's fade-out;
+                    // back-compute `start_a` in Track A's native tempo clock before snapping.
+                    let dur_a_native = f64::from(bars * beats_per_bar) * 60.0 / ba;
+                    let raw_start_a = end_a - dur_a_native;
+                    if raw_start_a < 4.0 {
+                        continue;
+                    }
+                    let start_a = meta_a
+                        .beats
+                        .as_ref()
+                        .map(|g| snap_to_downbeat(g, raw_start_a, 1.5))
+                        .unwrap_or(raw_start_a);
+                    if start_a < 4.0 {
+                        continue;
+                    }
+                    if dur_a_sec > 0.0 && start_a + dur_a_native > dur_a_sec + 0.5 {
                         continue;
                     }
                     if dur_b_sec > 0.0 && start_b + dur_sec > dur_b_sec * 0.6 {
@@ -659,18 +938,21 @@ pub fn synthesize_auto_transition(
         }
     }
 
-    // Non-beatmatched fallback (e.g. BPM ratio > max_bpm_ratio): smooth equal-power fade.
-    let start_a = out_cues[0].0;
-    let start_b = in_cues[0].0;
-    let remaining_a_ms = if dur_a_sec > start_a {
-        ((dur_a_sec - start_a) * 1000.0) as u64
+    // Non-beatmatched fallback (e.g. BPM ratio > max_bpm_ratio): smooth equal-power fade
+    // ending at Track A's `fade_out_cuepoint`.
+    let raw_end_a = out_cues[0].0;
+    let end_a = if dur_a_sec > 0.0 {
+        raw_end_a.min(dur_a_sec)
     } else {
-        DEFAULT_FALLBACK_FADE_MS
+        raw_end_a
     };
-    let fade_ms = remaining_a_ms.clamp(2_000, 6_000);
-    if dur_a_sec > 0.0 && start_a * 1000.0 + fade_ms as f64 > dur_a_sec * 1000.0 + 500.0 {
+    let fade_ms = DEFAULT_FALLBACK_FADE_MS.clamp(2_000, 6_000);
+    let fade_sec = fade_ms as f64 / 1000.0;
+    if end_a <= fade_sec + 1.0 {
         return None;
     }
+    let start_a = end_a - fade_sec;
+    let start_b = in_cues[0].0;
 
     let preset = BuiltinPreset::SimpleFade;
     let (out_curves, in_curves) = curves_for_builtin_preset(preset);
@@ -826,7 +1108,34 @@ impl TransitionResolver {
             }
         }
 
-        // 4. Priority 2: client-side Auto DJ synthesizer from Spotify track analysis extensions.
+        // 4. Priority 2: pre-computed `audio.fade_*` JSON curves & timing transferred from Connect.
+        if let Some(spec) = transition_from_fade_metadata(
+            TrackTransitionContext {
+                track_uri: &uri_a,
+                row_uid: &req.current_row_uid,
+                meta: &meta_a,
+            },
+            &req.current_metadata,
+            TrackTransitionContext {
+                track_uri: &uri_b,
+                row_uid: &req.next_row_uid,
+                meta: &meta_b,
+            },
+            &req.next_metadata,
+            &self.config,
+        ) {
+            debug!(
+                "Resolved transferred audio.fade_* transition for <{uri_a}> -> <{uri_b}> (beatmatched={}, start_a_frame={}, start_b_frame={}, dur_frames={})",
+                spec.tempo.as_ref().is_some_and(|t| t.beatmatched),
+                spec.start_a_frame,
+                spec.start_b_frame,
+                spec.duration_frames
+            );
+            result.spec = Some(spec);
+            return result;
+        }
+
+        // 5. Priority 3: client-side Auto DJ synthesizer from Spotify track analysis extensions.
         if let Some(spec) = synthesize_auto_transition(&meta_a, &meta_b, &self.config) {
             debug!(
                 "Synthesized Auto transition for <{uri_a}> -> <{uri_b}> (beatmatched={}, start_a_frame={}, dur_frames={})",
@@ -1301,5 +1610,299 @@ mod tests {
         let spec_non_bm = synthesize_auto_transition(&meta_153, &meta_125, &cfg).unwrap();
         assert!(spec_non_bm.tempo.is_none());
         assert!(spec_non_bm.duration_beats.is_none());
+    }
+
+    #[test]
+    fn fade_out_cuepoint_near_track_end_aligns_as_overlap_end() {
+        let cfg = MixConfig::default();
+        // Matches real Spotify `CUEPOINTS` where `best_fade_out_cuepoint` sits ~1.6 s before EOF.
+        let meta_a = TrackMixMetadata {
+            duration_ms: 201_000,
+            bpm: Some(145.0),
+            camelot_key: Some("2B".to_string()),
+            beats: Some(regular_beat_grid(145.0, 201.0)),
+            cuepoints: Some(Cuepoints {
+                best_fade_out_cuepoint: MessageField::some(Cuepoint {
+                    position_ms: 199_421,
+                    tempo_bpm: 145.0,
+                    confidence: 0.9,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            mixable: Some(true),
+            beatmatchability: Some(0.95),
+            ..Default::default()
+        };
+        let meta_b = TrackMixMetadata {
+            duration_ms: 256_000,
+            bpm: Some(150.0),
+            camelot_key: Some("2B".to_string()),
+            beats: Some(regular_beat_grid(150.0, 256.0)),
+            cuepoints: Some(Cuepoints {
+                best_fade_in_cuepoint: MessageField::some(Cuepoint {
+                    position_ms: 12_800,
+                    tempo_bpm: 150.0,
+                    confidence: 0.9,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            mixable: Some(true),
+            beatmatchability: Some(0.95),
+            ..Default::default()
+        };
+
+        let spec = synthesize_auto_transition(&meta_a, &meta_b, &cfg)
+            .expect("end-aligned fade_out_cuepoint near EOF must still synthesize");
+        let start_a_sec = spec.start_a_frame as f64 / f64::from(SAMPLE_RATE);
+        let dur_sec = spec.duration_frames as f64 / f64::from(SAMPLE_RATE);
+        // 8 bars at 145 BPM is ~13.24 s, so start_a must land ~186 s (ending near 199.4 s).
+        assert!(
+            start_a_sec > 180.0 && start_a_sec < 192.0,
+            "unexpected start_a_sec={start_a_sec}"
+        );
+        assert!(
+            start_a_sec + dur_sec <= 201.5,
+            "transition overflows track A EOF: end={}",
+            start_a_sec + dur_sec
+        );
+
+        // Non-beatmatched fallback must also back-compute `start_a = end_a - fade_sec`.
+        let mut meta_slow = meta_b;
+        meta_slow.bpm = Some(110.0);
+        meta_slow.beats = Some(regular_beat_grid(110.0, 256.0));
+        let spec_fb = synthesize_auto_transition(&meta_a, &meta_slow, &cfg)
+            .expect("non-beatmatched fallback must align end at best_fade_out_cuepoint");
+        let fb_start_sec = spec_fb.start_a_frame as f64 / f64::from(SAMPLE_RATE);
+        let fb_dur_sec = spec_fb.duration_frames as f64 / f64::from(SAMPLE_RATE);
+        assert!((fb_start_sec + fb_dur_sec - 199.421).abs() < 0.05);
+    }
+
+    #[test]
+    fn transferred_audio_fade_json_parses_cubic_bezier_and_validates_pair() {
+        use crate::playback::mix::SpecialRole;
+        use crate::playback::mix::curve::{apply_semantics, eval_curves};
+
+        let cfg = MixConfig::default();
+        let meta_a = TrackMixMetadata {
+            duration_ms: 201_000,
+            bpm: Some(145.0),
+            beats: Some(regular_beat_grid(145.0, 201.0)),
+            beatmatchability: Some(0.95),
+            ..Default::default()
+        };
+        let meta_b = TrackMixMetadata {
+            duration_ms: 256_000,
+            bpm: Some(150.0),
+            beats: Some(regular_beat_grid(150.0, 256.0)),
+            beatmatchability: Some(0.95),
+            ..Default::default()
+        };
+
+        let mut map_a = HashMap::new();
+        map_a.insert(
+            "audio.fade_out_start_time".to_string(),
+            "170444".to_string(),
+        );
+        map_a.insert("audio.fade_out_duration".to_string(), "26483".to_string());
+        map_a.insert(
+            "audio.fade_out_curves".to_string(),
+            r#"[{"start_point":0,"end_point":0.5,"fade_curve":[{"x":0,"y":1},{"x":1,"y":1}]},{"start_point":0.5,"end_point":1,"fade_curve":[{"x":0,"y":1},{"x":1,"y":0}]}]"#.to_string(),
+        );
+        map_a.insert(
+            "audio.fade_out_eq_low_gain_curves".to_string(),
+            r#"[{"start_point":0,"end_point":0.49609375,"fade_curve":[{"x":0,"y":0.5},{"x":1,"y":0.5}]},{"start_point":0.49609375,"end_point":0.5,"fade_curve":[{"x":0,"y":0.5},{"x":0.5,"y":0.5},{"x":0.5,"y":0},{"x":1,"y":0}]},{"start_point":0.5,"end_point":1,"fade_curve":[{"x":0,"y":0},{"x":1,"y":0}]}]"#.to_string(),
+        );
+        map_a.insert(
+            "audio.fade_out_filter_cutoff_curves".to_string(),
+            r#"[{"start_point":0,"end_point":0.5,"fade_curve":[{"x":0,"y":0.5},{"x":1,"y":0.5}]},{"start_point":0.5,"end_point":1,"fade_curve":[{"x":0,"y":0.5},{"x":0,"y":0.5},{"x":1,"y":1},{"x":1,"y":1}]}]"#.to_string(),
+        );
+        map_a.insert(
+            "audio.fade_out_filter_resonance_curves".to_string(),
+            r#"[{"start_point":0,"end_point":1,"fade_curve":[{"x":0,"y":0.5},{"x":1,"y":0.5}]}]"#
+                .to_string(),
+        );
+
+        let mut map_b = HashMap::new();
+        map_b.insert("audio.fade_in_start_time".to_string(), "12800".to_string());
+        map_b.insert("audio.fade_in_duration".to_string(), "25600".to_string());
+        map_b.insert("audio.fade_overlap".to_string(), "26483".to_string());
+        map_b.insert(
+            "audio.fade_in_curves".to_string(),
+            r#"[{"start_point":0,"end_point":0.5,"fade_curve":[{"x":0,"y":0},{"x":1,"y":1}]},{"start_point":0.5,"end_point":1,"fade_curve":[{"x":0,"y":1},{"x":1,"y":1}]}]"#.to_string(),
+        );
+        map_b.insert(
+            "audio.fade_in_eq_low_gain_curves".to_string(),
+            r#"[{"start_point":0,"end_point":0.49609375,"fade_curve":[{"x":0,"y":0},{"x":1,"y":0}]},{"start_point":0.49609375,"end_point":0.5,"fade_curve":[{"x":0,"y":0},{"x":0.5,"y":0},{"x":0.5,"y":0.5},{"x":1,"y":0.5}]},{"start_point":0.5,"end_point":1,"fade_curve":[{"x":0,"y":0.5},{"x":1,"y":0.5}]}]"#.to_string(),
+        );
+
+        let spec = transition_from_fade_metadata(
+            TrackTransitionContext {
+                track_uri: "spotify:track:fixture_a",
+                row_uid: "row_a",
+                meta: &meta_a,
+            },
+            &map_a,
+            TrackTransitionContext {
+                track_uri: "spotify:track:fixture_b",
+                row_uid: "row_b",
+                meta: &meta_b,
+            },
+            &map_b,
+            &cfg,
+        )
+        .expect("valid transferred fade metadata must build TransitionSpec");
+
+        assert_eq!(spec.start_a_frame, ms_to_frames(170_444));
+        assert_eq!(spec.start_b_frame, ms_to_frames(12_800));
+        assert_eq!(spec.duration_beats, Some(64.0));
+        assert!(spec.tempo.as_ref().unwrap().beatmatched);
+
+        // Bipolar EQ semantics: 0.5 -> 1.0 linear unity, 0.0 -> Kill.
+        let eq_sem = spec.out_curves.eq_semantics.as_ref().unwrap();
+        let eq_start = apply_semantics(
+            eval_curves(spec.out_curves.eq_low.as_ref().unwrap(), 0.2).unwrap(),
+            eq_sem,
+        );
+        assert!((eq_start.as_linear_gain().unwrap() - 1.0).abs() < 1e-6);
+        let eq_end = apply_semantics(
+            eval_curves(spec.out_curves.eq_low.as_ref().unwrap(), 0.8).unwrap(),
+            eq_sem,
+        );
+        assert_eq!(eq_end.role, Some(SpecialRole::Kill));
+
+        // Resonance semantics: 0.5 -> neutral Butterworth Q (~0.7071).
+        let res_sem = spec.out_curves.filter_resonance_semantics.as_ref().unwrap();
+        let res_val = apply_semantics(
+            eval_curves(spec.out_curves.filter_resonance.as_ref().unwrap(), 0.5).unwrap(),
+            res_sem,
+        );
+        assert!((res_val.numeric.unwrap() - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+
+        // Pair consistency guard: mismatched `audio.fade_overlap` (e.g. queued track) must reject.
+        map_b.insert("audio.fade_overlap".to_string(), "14656".to_string());
+        assert!(
+            transition_from_fade_metadata(
+                TrackTransitionContext {
+                    track_uri: "spotify:track:fixture_a",
+                    row_uid: "row_a",
+                    meta: &meta_a,
+                },
+                &map_a,
+                TrackTransitionContext {
+                    track_uri: "spotify:track:fixture_b",
+                    row_uid: "row_b",
+                    meta: &meta_b,
+                },
+                &map_b,
+                &cfg,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn custom_recipe_handles_halftime_dnb_cut_and_preset_type_fallback() {
+        use crate::protocol::transition::{FilterFxStyle, PresetType, VolumeStyle};
+
+        let cfg = MixConfig::default();
+        let meta = TrackMixMetadata::default();
+
+        // 1. Half-time non-beatmatched custom cut (174 BPM -> 86.87 BPM, 5000 ms, volume cut + filter 6).
+        let mut preset_cut = Preset {
+            id: 1,
+            volume_style_override: MessageField::some(VolumeStyle {
+                id: 1,
+                ..Default::default()
+            }),
+            filter_fx_style_override: MessageField::some(FilterFxStyle {
+                id: 6,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        preset_cut.type_ = protobuf::EnumOrUnknown::new(PresetType::PRESET_TYPE_FADE);
+        let proto_cut = Transition {
+            overlap: MessageField::some(Overlap {
+                track_a_uri: "spotify:track:dnb_a".to_string(),
+                track_b_uri: "spotify:track:dnb_b".to_string(),
+                track_a_row_id: "r1".to_string(),
+                track_b_row_id: "r2".to_string(),
+                start_a_ms: 157_043,
+                start_b_ms: 62_814,
+                duration_ms: 5_000,
+                speed_a: Some(1.0),
+                speed_b: Some(1.0),
+                is_beatmatched: false,
+                bpm_a: 174.0,
+                bpm_b: 86.87,
+                item_speed_a: 1.0,
+                item_speed_b: 1.0,
+                ..Default::default()
+            }),
+            preset: MessageField::some(preset_cut),
+            is_overlap_override: true,
+            ..Default::default()
+        };
+        let spec_cut = transition_proto_to_spec(
+            &proto_cut,
+            TrackTransitionContext {
+                track_uri: "spotify:track:dnb_a",
+                row_uid: "r1",
+                meta: &meta,
+            },
+            TrackTransitionContext {
+                track_uri: "spotify:track:dnb_b",
+                row_uid: "r2",
+                meta: &meta,
+            },
+            &cfg,
+        )
+        .expect("custom cut recipe must produce spec");
+        assert!(spec_cut.tempo.is_none());
+        assert!(spec_cut.out_curves.filter_cutoff.is_some());
+
+        // 2. Newer preset ID (8) with `PRESET_TYPE_BEATMATCHED_FADE` falls back cleanly to BassSwap.
+        let mut preset_8 = Preset {
+            id: 8,
+            ..Default::default()
+        };
+        preset_8.type_ = protobuf::EnumOrUnknown::new(PresetType::PRESET_TYPE_BEATMATCHED_FADE);
+        let proto_bm = Transition {
+            overlap: MessageField::some(Overlap {
+                track_a_uri: "spotify:track:dnb_b".to_string(),
+                track_b_uri: "spotify:track:dnb_c".to_string(),
+                start_a_ms: 215_169,
+                start_b_ms: 74_481,
+                duration_ms: 11_035,
+                duration_bars: Some(8),
+                is_beatmatched: true,
+                bpm_a: 174.0,
+                bpm_b: 174.0,
+                ..Default::default()
+            }),
+            preset: MessageField::some(preset_8),
+            is_overlap_override: true,
+            ..Default::default()
+        };
+        let spec_bm = transition_proto_to_spec(
+            &proto_bm,
+            TrackTransitionContext {
+                track_uri: "spotify:track:dnb_b",
+                row_uid: "",
+                meta: &meta,
+            },
+            TrackTransitionContext {
+                track_uri: "spotify:track:dnb_c",
+                row_uid: "",
+                meta: &meta,
+            },
+            &cfg,
+        )
+        .expect("beatmatched preset 8 recipe must produce spec");
+        assert!(spec_bm.tempo.as_ref().unwrap().beatmatched);
+        assert_eq!(spec_bm.duration_beats, Some(32.0));
+        assert!(spec_bm.out_curves.eq_low.is_some());
     }
 }

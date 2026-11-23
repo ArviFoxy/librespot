@@ -1,8 +1,8 @@
 //! Evaluators for automation curves and `AutomationValueSemantics`.
 
 use super::spec::{
-    AutomationCurve, AutomationCurves, FilterMode, SegmentEasing, SegmentInterpolation,
-    SpecialResult, SpecialRole, ValueMapping, ValueSemantics, ValueUnit,
+    AutomationCurve, AutomationCurves, CurveInterpolation, CurvePoint, FilterMode, SegmentEasing,
+    SegmentInterpolation, SpecialResult, SpecialRole, ValueMapping, ValueSemantics, ValueUnit,
 };
 
 /// Result of evaluating a raw curve value through [`ValueSemantics`].
@@ -66,6 +66,10 @@ pub fn eval_curve(curve: &AutomationCurve, u: f64) -> Option<f64> {
         return Some(last.y);
     }
 
+    if curve.interpolation == CurveInterpolation::CubicBezier && curve.points.len() >= 4 {
+        return Some(eval_cubic_bezier_chain(&curve.points, x));
+    }
+
     // Binary search for the segment containing x.
     let idx = curve.points.partition_point(|p| p.x < x);
     let p0 = curve.points[idx.saturating_sub(1)];
@@ -76,6 +80,79 @@ pub fn eval_curve(curve: &AutomationCurve, u: f64) -> Option<f64> {
     }
     let t = ((x - p0.x) / dx).clamp(0.0, 1.0);
     Some(p0.y + t * (p1.y - p0.y))
+}
+
+/// Evaluate a 4-point (or chained `3k + 1`-point) monotonic cubic Bézier curve at coordinate `x`.
+///
+/// Uses safeguarded Newton-Raphson with bisection fallback to invert `B_x(t) = x`, which remains
+/// accurate to `< 1e-12` even when endpoints have zero horizontal derivative (e.g. `P1.x == P0.x`).
+fn eval_cubic_bezier_chain(points: &[CurvePoint], x: f64) -> f64 {
+    let seg_count = (points.len() - 1) / 3;
+    let mut seg_idx = 0;
+    for s in 0..seg_count {
+        let base = s * 3;
+        if x >= points[base].x && x <= points[base + 3].x {
+            seg_idx = s;
+            break;
+        }
+        if x > points[base + 3].x {
+            seg_idx = s;
+        }
+    }
+
+    let base = seg_idx * 3;
+    let p0 = points[base];
+    let p1 = points[base + 1];
+    let p2 = points[base + 2];
+    let p3 = points[base + 3];
+
+    if x <= p0.x {
+        return p0.y;
+    }
+    if x >= p3.x {
+        return p3.y;
+    }
+
+    let ax = p3.x - 3.0 * p2.x + 3.0 * p1.x - p0.x;
+    let bx = 3.0 * (p2.x - 2.0 * p1.x + p0.x);
+    let cx = 3.0 * (p1.x - p0.x);
+    let dx = p0.x;
+
+    let mut lo = 0.0_f64;
+    let mut hi = 1.0_f64;
+    let span_x = (p3.x - p0.x).max(f64::EPSILON);
+    let mut t = ((x - p0.x) / span_x).clamp(0.0, 1.0);
+
+    for _ in 0..24 {
+        let bx_val = ((ax * t + bx) * t + cx) * t + dx;
+        let err = bx_val - x;
+        if err.abs() < 1e-12 {
+            break;
+        }
+        if err < 0.0 {
+            lo = t;
+        } else {
+            hi = t;
+        }
+        let deriv = (3.0 * ax * t + 2.0 * bx) * t + cx;
+        let next = if deriv.abs() > 1e-12 {
+            let candidate = t - err / deriv;
+            if candidate > lo && candidate < hi {
+                candidate
+            } else {
+                0.5 * (lo + hi)
+            }
+        } else {
+            0.5 * (lo + hi)
+        };
+        t = next;
+    }
+
+    let ay = p3.y - 3.0 * p2.y + 3.0 * p1.y - p0.y;
+    let by = 3.0 * (p2.y - 2.0 * p1.y + p0.y);
+    let cy = 3.0 * (p1.y - p0.y);
+    let dy = p0.y;
+    ((ay * t + by) * t + cy) * t + dy
 }
 
 /// Evaluate an [`AutomationCurves`] collection at normalized transition progress `u in [0.0, 1.0]`.
@@ -300,20 +377,126 @@ mod tests {
     #[test]
     fn curves_evaluate_and_clamp() {
         let curves = AutomationCurves {
-            curves: vec![AutomationCurve {
-                points: vec![
+            curves: vec![AutomationCurve::linear(
+                vec![
                     CurvePoint { x: 0.0, y: 1.0 },
                     CurvePoint { x: 0.5, y: 0.5 },
                     CurvePoint { x: 1.0, y: 0.0 },
                 ],
-                start: 0.0,
-                end: 1.0,
-            }],
+                0.0,
+                1.0,
+            )],
             minimum: 0.0,
             maximum: 1.0,
         };
         assert!((eval_curves(&curves, 0.25).unwrap() - 0.75).abs() < 1e-12);
         assert!((eval_curves(&curves, 0.75).unwrap() - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cubic_bezier_evaluates_degenerate_line_and_smooth_s_curves() {
+        // 1. Degenerate straight-line Bézier where P1 == P0 and P2 == P3 (zero endpoint derivative).
+        let straight = AutomationCurve::cubic_bezier(
+            vec![
+                CurvePoint { x: 0.0, y: 0.5 },
+                CurvePoint { x: 0.0, y: 0.5 },
+                CurvePoint { x: 1.0, y: 1.0 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ],
+            0.5,
+            1.0,
+        );
+        for i in 0..=20 {
+            let u = 0.5 + 0.5 * (i as f64 / 20.0);
+            let local_x = (u - 0.5) / 0.5;
+            let expected = 0.5 + 0.5 * local_x;
+            let actual = eval_curve(&straight, u).unwrap();
+            assert!(
+                (actual - expected).abs() < 1e-9,
+                "u={u}: got {actual}, expected {expected}"
+            );
+        }
+
+        // 2. Symmetric S-curve with repeated P1.x == P2.x == 0.5 (Spotify bass-swap EQ transition).
+        let s_curve = AutomationCurve::cubic_bezier(
+            vec![
+                CurvePoint { x: 0.0, y: 0.5 },
+                CurvePoint { x: 0.5, y: 0.5 },
+                CurvePoint { x: 0.5, y: 0.0 },
+                CurvePoint { x: 1.0, y: 0.0 },
+            ],
+            0.0,
+            1.0,
+        );
+        assert!((eval_curve(&s_curve, 0.0).unwrap() - 0.5).abs() < 1e-12);
+        assert!((eval_curve(&s_curve, 0.5).unwrap() - 0.25).abs() < 1e-12);
+        assert!(eval_curve(&s_curve, 1.0).unwrap().abs() < 1e-12);
+        // Must be strictly smooth and monotonic decreasing (not a hard step at x=0.5).
+        let q1 = eval_curve(&s_curve, 0.25).unwrap();
+        let q3 = eval_curve(&s_curve, 0.75).unwrap();
+        assert!(
+            q1 < 0.49 && q1 > 0.25,
+            "expected smooth drop at q1, got {q1}"
+        );
+        assert!(
+            q3 > 0.01 && q3 < 0.25,
+            "expected smooth tail at q3, got {q3}"
+        );
+        assert!((q1 + q3 - 0.5).abs() < 1e-9);
+
+        // 3. Asymmetric S-curve [(0,1), (0.6,1), (0.6,0), (1,0)] stays monotonic over [0, 1].
+        let asym = AutomationCurve::cubic_bezier(
+            vec![
+                CurvePoint { x: 0.0, y: 1.0 },
+                CurvePoint { x: 0.6, y: 1.0 },
+                CurvePoint { x: 0.6, y: 0.0 },
+                CurvePoint { x: 1.0, y: 0.0 },
+            ],
+            0.0,
+            1.0,
+        );
+        let mut prev = 1.0_f64;
+        for i in 1..=50 {
+            let u = i as f64 / 50.0;
+            let v = eval_curve(&asym, u).unwrap();
+            assert!(v <= prev + 1e-12, "non-monotonic at u={u}: {v} > {prev}");
+            prev = v;
+        }
+        assert!(prev.abs() < 1e-12);
+    }
+
+    #[test]
+    fn mixed_linear_and_cubic_bezier_segments_stitch_smoothly() {
+        let eq_out = AutomationCurves {
+            curves: vec![
+                AutomationCurve::linear(
+                    vec![CurvePoint { x: 0.0, y: 0.5 }, CurvePoint { x: 1.0, y: 0.5 }],
+                    0.0,
+                    0.49609375,
+                ),
+                AutomationCurve::cubic_bezier(
+                    vec![
+                        CurvePoint { x: 0.0, y: 0.5 },
+                        CurvePoint { x: 0.5, y: 0.5 },
+                        CurvePoint { x: 0.5, y: 0.0 },
+                        CurvePoint { x: 1.0, y: 0.0 },
+                    ],
+                    0.49609375,
+                    0.5,
+                ),
+                AutomationCurve::linear(
+                    vec![CurvePoint { x: 0.0, y: 0.0 }, CurvePoint { x: 1.0, y: 0.0 }],
+                    0.5,
+                    1.0,
+                ),
+            ],
+            minimum: 0.0,
+            maximum: 1.0,
+        };
+        assert!((eval_curves(&eq_out, 0.25).unwrap() - 0.5).abs() < 1e-12);
+        let mid = eval_curves(&eq_out, 0.498046875).unwrap();
+        assert!((mid - 0.25).abs() < 1e-9, "got {mid}");
+        assert!(eval_curves(&eq_out, 0.75).unwrap().abs() < 1e-12);
     }
 
     #[test]

@@ -758,11 +758,11 @@ mod tests {
         let pcm_b = generate_kick_track(150.0, 22, 0.0, 1.0);
 
         let flat_full = AutomationCurves {
-            curves: vec![AutomationCurve {
-                points: vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 1.0 }],
-                start: 0.0,
-                end: 1.0,
-            }],
+            curves: vec![AutomationCurve::linear(
+                vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 1.0 }],
+                0.0,
+                1.0,
+            )],
             minimum: 0.0,
             maximum: 1.0,
         };
@@ -951,11 +951,11 @@ mod tests {
 
         let mut spec = TransitionSpec::equal_power_crossfade(0, 0, SAMPLE_RATE as u64);
         spec.out_curves.eq_low = Some(AutomationCurves {
-            curves: vec![AutomationCurve {
-                points: vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 1.0 }],
-                start: 0.0,
-                end: 1.0,
-            }],
+            curves: vec![AutomationCurve::linear(
+                vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 1.0 }],
+                0.0,
+                1.0,
+            )],
             minimum: 0.0,
             maximum: 1.0,
         });
@@ -1013,23 +1013,23 @@ mod tests {
 
         let mut spec = TransitionSpec::equal_power_crossfade(0, 0, SAMPLE_RATE as u64);
         spec.out_curves.filter_cutoff = Some(AutomationCurves {
-            curves: vec![AutomationCurve {
-                points: vec![
+            curves: vec![AutomationCurve::linear(
+                vec![
                     CurvePoint { x: 0.0, y: 0.45 },
                     CurvePoint { x: 1.0, y: 0.05 },
                 ],
-                start: 0.0,
-                end: 1.0,
-            }],
+                0.0,
+                1.0,
+            )],
             minimum: 0.0,
             maximum: 1.0,
         });
         spec.out_curves.filter_resonance = Some(AutomationCurves {
-            curves: vec![AutomationCurve {
-                points: vec![CurvePoint { x: 0.0, y: 5.0 }, CurvePoint { x: 1.0, y: 5.0 }],
-                start: 0.0,
-                end: 1.0,
-            }],
+            curves: vec![AutomationCurve::linear(
+                vec![CurvePoint { x: 0.0, y: 5.0 }, CurvePoint { x: 1.0, y: 5.0 }],
+                0.0,
+                1.0,
+            )],
             minimum: 0.5,
             maximum: 8.0,
         });
@@ -1071,40 +1071,40 @@ mod tests {
         }
 
         let flat_vol = AutomationCurves {
-            curves: vec![AutomationCurve {
-                points: vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 1.0 }],
-                start: 0.0,
-                end: 1.0,
-            }],
+            curves: vec![AutomationCurve::linear(
+                vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 1.0 }],
+                0.0,
+                1.0,
+            )],
             minimum: 0.0,
             maximum: 1.0,
         };
         // Smooth bass swap centered at u = 0.5 (Deck A kills low band while Deck B brings low band in).
         let low_out = AutomationCurves {
-            curves: vec![AutomationCurve {
-                points: vec![
+            curves: vec![AutomationCurve::linear(
+                vec![
                     CurvePoint { x: 0.0, y: 1.0 },
                     CurvePoint { x: 0.35, y: 1.0 },
                     CurvePoint { x: 0.65, y: 0.0 },
                     CurvePoint { x: 1.0, y: 0.0 },
                 ],
-                start: 0.0,
-                end: 1.0,
-            }],
+                0.0,
+                1.0,
+            )],
             minimum: 0.0,
             maximum: 1.0,
         };
         let low_in = AutomationCurves {
-            curves: vec![AutomationCurve {
-                points: vec![
+            curves: vec![AutomationCurve::linear(
+                vec![
                     CurvePoint { x: 0.0, y: 0.0 },
                     CurvePoint { x: 0.35, y: 0.0 },
                     CurvePoint { x: 0.65, y: 1.0 },
                     CurvePoint { x: 1.0, y: 1.0 },
                 ],
-                start: 0.0,
-                end: 1.0,
-            }],
+                0.0,
+                1.0,
+            )],
             minimum: 0.0,
             maximum: 1.0,
         };

@@ -7,13 +7,46 @@ pub struct CurvePoint {
     pub y: f64,
 }
 
-/// A piecewise-linear automation segment spanning `[start, end]` in normalized
-/// transition progress `u in [0.0, 1.0]`.
+/// Interpolation mode for an [`AutomationCurve`] segment's control points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CurveInterpolation {
+    /// Piecewise-linear interpolation through ordered `(x, y)` points.
+    #[default]
+    Linear,
+    /// Standard 4-point (or chained `3k + 1`-point) cubic Bézier segments `(P0, P1, P2, P3)`.
+    /// Falls back to piecewise-linear when fewer than 4 points are present.
+    CubicBezier,
+}
+
+/// An automation segment spanning `[start, end]` in normalized transition progress `u in [0.0, 1.0]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutomationCurve {
     pub points: Vec<CurvePoint>,
     pub start: f64,
     pub end: f64,
+    pub interpolation: CurveInterpolation,
+}
+
+impl AutomationCurve {
+    /// Construct a piecewise-linear [`AutomationCurve`].
+    pub fn linear(points: Vec<CurvePoint>, start: f64, end: f64) -> Self {
+        Self {
+            points,
+            start,
+            end,
+            interpolation: CurveInterpolation::Linear,
+        }
+    }
+
+    /// Construct a cubic Bézier [`AutomationCurve`].
+    pub fn cubic_bezier(points: Vec<CurvePoint>, start: f64, end: f64) -> Self {
+        Self {
+            points,
+            start,
+            end,
+            interpolation: CurveInterpolation::CubicBezier,
+        }
+    }
 }
 
 /// A set of automation curves bounded by `[minimum, maximum]`.

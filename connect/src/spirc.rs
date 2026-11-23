@@ -2030,7 +2030,9 @@ impl SpircTask {
             },
         };
         self.connect_state.set_status(&self.play_status);
-        self.trigger_transition_resolve();
+        // Transition resolution for the new `(incoming -> next)` pair is triggered by the
+        // `PlayerEvent::TrackChanged` emitted immediately after `TransitionCommit`, once
+        // the incoming track's real `duration_ms` has been updated in `ConnectState`.
         Ok(())
     }
 

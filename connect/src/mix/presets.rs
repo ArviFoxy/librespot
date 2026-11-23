@@ -7,7 +7,7 @@ use std::f64::consts::FRAC_PI_2;
 
 use crate::{
     playback::mix::{
-        AutomationCurve, AutomationCurves, CurvePoint, DeckCurves, FilterMode,
+        AutomationCurve, AutomationCurves, CurveInterpolation, CurvePoint, DeckCurves, FilterMode,
         InterpolationSegment, SegmentEasing, SegmentInterpolation, SpecialCase, SpecialResult,
         SpecialRole, ValueMapping, ValueSemantics, ValueUnit,
     },
@@ -239,11 +239,11 @@ fn clear_filter(deck: &mut DeckCurves) {
 
 fn curve_from_points(pts: &[(f64, f64)], min: f64, max: f64) -> AutomationCurves {
     AutomationCurves {
-        curves: vec![AutomationCurve {
-            points: pts.iter().map(|&(x, y)| CurvePoint { x, y }).collect(),
-            start: 0.0,
-            end: 1.0,
-        }],
+        curves: vec![AutomationCurve::linear(
+            pts.iter().map(|&(x, y)| CurvePoint { x, y }).collect(),
+            0.0,
+            1.0,
+        )],
         minimum: min,
         maximum: max,
     }
@@ -260,11 +260,7 @@ fn sampled_curve(steps: usize, min: f64, max: f64, f: impl Fn(f64) -> f64) -> Au
         })
         .collect();
     AutomationCurves {
-        curves: vec![AutomationCurve {
-            points,
-            start: 0.0,
-            end: 1.0,
-        }],
+        curves: vec![AutomationCurve::linear(points, 0.0, 1.0)],
         minimum: min,
         maximum: max,
     }
@@ -599,20 +595,92 @@ fn apply_filter_style(style_id: i32, out: &mut DeckCurves, inc: &mut DeckCurves)
     }
 }
 
+/// Value semantics for Spotify's normalized `[0.0, 1.0]` bipolar EQ gain curves
+/// (`0.0` = full kill, `0.5` = 0 dB unity, `1.0` = +6 dB boost).
+pub fn bipolar_eq_semantics() -> ValueSemantics {
+    ValueSemantics {
+        output_unit: ValueUnit::Linear,
+        special_cases: vec![SpecialCase {
+            raw_min: -0.01,
+            raw_max: 0.001,
+            result: SpecialResult::Role(SpecialRole::Kill),
+        }],
+        mapping: ValueMapping::Piecewise(vec![
+            InterpolationSegment {
+                raw_start: 0.0,
+                raw_end: 0.5,
+                output_start: 0.0,
+                output_end: 1.0,
+                output_mode: None,
+                interpolation: SegmentInterpolation::Linear,
+                easing: SegmentEasing::None,
+            },
+            InterpolationSegment {
+                raw_start: 0.5,
+                raw_end: 1.0,
+                output_start: 1.0,
+                output_end: 2.0,
+                output_mode: None,
+                interpolation: SegmentInterpolation::Linear,
+                easing: SegmentEasing::None,
+            },
+        ]),
+    }
+}
+
+/// Value semantics for Spotify's normalized `[0.0, 1.0]` filter resonance curves
+/// (`0.5` = neutral Butterworth `Q = 1/sqrt(2)`, `1.0` = resonant `Q = 3.0`).
+pub fn bipolar_resonance_semantics() -> ValueSemantics {
+    let neutral_q = std::f64::consts::FRAC_1_SQRT_2;
+    ValueSemantics {
+        output_unit: ValueUnit::Linear,
+        special_cases: Vec::new(),
+        mapping: ValueMapping::Piecewise(vec![
+            InterpolationSegment {
+                raw_start: 0.0,
+                raw_end: 0.5,
+                output_start: 0.5,
+                output_end: neutral_q,
+                output_mode: None,
+                interpolation: SegmentInterpolation::Linear,
+                easing: SegmentEasing::None,
+            },
+            InterpolationSegment {
+                raw_start: 0.5,
+                raw_end: 1.0,
+                output_start: neutral_q,
+                output_end: 3.0,
+                output_mode: None,
+                interpolation: SegmentInterpolation::Linear,
+                easing: SegmentEasing::None,
+            },
+        ]),
+    }
+}
+
 /// Convert a protobuf [`ProtoCurves`] message into protocol-agnostic [`AutomationCurves`].
 pub fn convert_proto_curves(proto: &ProtoCurves) -> AutomationCurves {
     AutomationCurves {
         curves: proto
             .curves
             .iter()
-            .map(|c| AutomationCurve {
-                points: c
+            .map(|c| {
+                let points: Vec<CurvePoint> = c
                     .points
                     .iter()
                     .map(|p| CurvePoint { x: p.x, y: p.y })
-                    .collect(),
-                start: c.start,
-                end: c.end,
+                    .collect();
+                let interpolation = if points.len() >= 4 && (points.len() - 1) % 3 == 0 {
+                    CurveInterpolation::CubicBezier
+                } else {
+                    CurveInterpolation::Linear
+                };
+                AutomationCurve {
+                    points,
+                    start: c.start,
+                    end: c.end,
+                    interpolation,
+                }
             })
             .collect(),
         minimum: proto.minimum,

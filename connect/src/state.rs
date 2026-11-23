@@ -195,6 +195,8 @@ impl ConnectState {
                 supports_playlist_mixing: cfg.mix_config.mode != MixMode::Off,
                 #[cfg(feature = "mix-transitions")]
                 supports_gapless: true,
+                #[cfg(feature = "mix-transitions")]
+                supports_crossfade: cfg.mix_config.mode != MixMode::Off,
                 // AudioQuality::HIFI is available, further investigation necessary
                 supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),
 

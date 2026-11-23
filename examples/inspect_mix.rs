@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, env, fs, path::PathBuf, process::exit};
 
 use data_encoding::{BASE64, BASE64_NOPAD, BASE64URL, BASE64URL_NOPAD, HEXLOWER};
+use futures_util::StreamExt;
 use librespot::{
     core::{
         SpotifyUri, authentication::Credentials, cache::Cache, config::SessionConfig,
@@ -10,6 +11,9 @@ use librespot::{
     protocol::{
         audio_attributes_v2::AudioAttributes,
         automix_mode::AutomixMode,
+        connect::{
+            Capabilities, Cluster, Device, DeviceInfo, MemberType, PutStateReason, PutStateRequest,
+        },
         cuepoints::Cuepoints,
         extension_kind::ExtensionKind,
         mix_beats::Beats,
@@ -17,7 +21,7 @@ use librespot::{
         mix_vocal_activity::VocalActivity,
         mixability::Mixability,
         playlist4_external::SelectedListContent,
-        protobuf::{Message, UnknownFields, UnknownValueRef},
+        protobuf::{EnumOrUnknown, Message, MessageField, UnknownFields, UnknownValueRef},
         transition::Transition,
         transition_metadata_extension::TransitionMetadataExtensionResponse,
     },
@@ -25,9 +29,9 @@ use librespot::{
 
 fn usage(bin: &str) -> ! {
     eprintln!(
-        "Usage: {bin} [--cache DIR | --token TOKEN] [--limit N] [--save-fixtures DIR] <PLAYLIST_URI_OR_ID>\n\
+        "Usage: {bin} [--cache DIR | --token TOKEN] [--limit N] [--save-fixtures DIR] [--cluster] [PLAYLIST_URI_OR_ID]\n\
          \n\
-         Inspects Spotify playlist4, context-resolve, and extended-metadata payloads for Mix/transition data.\n\
+         Inspects Spotify playlist4, context-resolve, extended-metadata, and (--cluster) live Connect cluster state.\n\
          If --cache DIR is given and contains no credentials yet, starts Spotify's device authorization flow\n\
          (spotify.com/pair) and stores credentials in DIR."
     );
@@ -203,6 +207,7 @@ async fn main() {
     let mut cache_dir: Option<PathBuf> = None;
     let mut token: Option<String> = None;
     let mut save_fixtures: Option<PathBuf> = None;
+    let mut inspect_cluster = false;
     let mut limit: usize = 6;
     let mut playlist_arg: Option<String> = None;
 
@@ -229,6 +234,9 @@ async fn main() {
                 i += 1;
                 save_fixtures = Some(PathBuf::from(args.get(i).unwrap_or_else(|| usage(bin))));
             }
+            "--cluster" => {
+                inspect_cluster = true;
+            }
             "-h" | "--help" => usage(bin),
             arg if !arg.starts_with('-') && playlist_arg.is_none() => {
                 playlist_arg = Some(arg.to_string());
@@ -238,34 +246,40 @@ async fn main() {
         i += 1;
     }
 
-    let playlist_arg = playlist_arg.unwrap_or_else(|| usage(bin));
-    let playlist_uri = if playlist_arg.starts_with("spotify:") {
-        SpotifyUri::from_uri(&playlist_arg).unwrap_or_else(|e| {
-            eprintln!("Invalid playlist URI: {e}");
-            exit(1);
-        })
-    } else {
-        let id_str = playlist_arg
-            .split("/playlist/")
-            .nth(1)
-            .unwrap_or(&playlist_arg)
-            .split('?')
-            .next()
-            .unwrap_or(&playlist_arg);
-        SpotifyUri::from_uri(&format!("spotify:playlist:{id_str}")).unwrap_or_else(|e| {
-            eprintln!("Invalid playlist ID/URL: {e}");
-            exit(1);
-        })
-    };
+    if !inspect_cluster && playlist_arg.is_none() {
+        usage(bin);
+    }
 
-    let SpotifyUri::Playlist {
-        id: playlist_id, ..
-    } = playlist_uri
-    else {
-        eprintln!("Expected a playlist URI, got {playlist_uri:?}");
-        exit(1);
-    };
-    let canonical_playlist_uri = format!("spotify:playlist:{}", playlist_id.to_base62());
+    let playlist_id_and_uri = playlist_arg.map(|playlist_arg| {
+        let playlist_uri = if playlist_arg.starts_with("spotify:") {
+            SpotifyUri::from_uri(&playlist_arg).unwrap_or_else(|e| {
+                eprintln!("Invalid playlist URI: {e}");
+                exit(1);
+            })
+        } else {
+            let id_str = playlist_arg
+                .split("/playlist/")
+                .nth(1)
+                .unwrap_or(&playlist_arg)
+                .split('?')
+                .next()
+                .unwrap_or(&playlist_arg);
+            SpotifyUri::from_uri(&format!("spotify:playlist:{id_str}")).unwrap_or_else(|e| {
+                eprintln!("Invalid playlist ID/URL: {e}");
+                exit(1);
+            })
+        };
+
+        let SpotifyUri::Playlist {
+            id: playlist_id, ..
+        } = playlist_uri
+        else {
+            eprintln!("Expected a playlist URI, got {playlist_uri:?}");
+            exit(1);
+        };
+        let canonical = format!("spotify:playlist:{}", playlist_id.to_base62());
+        (playlist_id, canonical)
+    });
 
     let session_config = SessionConfig::default();
     let cache = cache_dir
@@ -299,10 +313,103 @@ async fn main() {
     };
 
     let session = Session::new(session_config, cache);
+    let mut conn_id_rx = if inspect_cluster {
+        Some(
+            session
+                .dealer()
+                .listen_for("hm://pusher/v1/connections/", |msg| {
+                    Ok(msg
+                        .headers
+                        .get("Spotify-Connection-Id")
+                        .cloned()
+                        .unwrap_or_default())
+                })
+                .expect("listen connection id"),
+        )
+    } else {
+        None
+    };
+
     if let Err(e) = session.connect(credentials, cache_dir.is_some()).await {
         eprintln!("Session connect failed: {e}");
         exit(1);
     }
+
+    if let Some(mut rx) = conn_id_rx.take() {
+        println!("=== 0. Connect Cluster State ===");
+        session.dealer().start().await.expect("start dealer");
+        if let Some(Ok(conn_id)) = rx.next().await {
+            session.set_connection_id(&conn_id);
+            let req = PutStateRequest {
+                member_type: EnumOrUnknown::new(MemberType::ACTIVE_DEVICE_TRACKER),
+                put_state_reason: EnumOrUnknown::new(PutStateReason::NEW_CONNECTION),
+                is_active: false,
+                device: MessageField::some(Device {
+                    device_info: MessageField::some(DeviceInfo {
+                        device_id: session.device_id().to_string(),
+                        name: "inspect_mix".to_string(),
+                        can_play: false,
+                        client_id: session.client_id(),
+                        capabilities: MessageField::some(Capabilities {
+                            hidden: true,
+                            can_be_player: false,
+                            is_controllable: false,
+                            is_observable: false,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            match session.spclient().put_connect_state_request(&req).await {
+                Ok(raw) => match Cluster::parse_from_bytes(&raw) {
+                    Ok(cluster) => {
+                        println!("active_device_id = {:?}", cluster.active_device_id);
+                        for (id, info) in &cluster.device {
+                            let cap = info.capabilities.as_ref();
+                            println!("\nDevice {id:?} (name={:?}):", info.name);
+                            println!(
+                                "  type={:?} software={:?} spirc={:?} client_id={:?} brand={:?} model={:?} license={:?} is_group={}",
+                                info.device_type,
+                                info.device_software_version,
+                                info.spirc_version,
+                                info.client_id,
+                                info.brand,
+                                info.model,
+                                info.license,
+                                info.is_group,
+                            );
+                            if !info.metadata_map.is_empty() {
+                                println!("  metadata_map = {:?}", info.metadata_map);
+                            }
+                            if let Some(c) = cap {
+                                println!("  capabilities = {c:#?}");
+                                let unk =
+                                    summarize_unknown_fields(c.special_fields().unknown_fields());
+                                if !unk.is_empty() {
+                                    println!("  capabilities unknown_fields = {unk:?}");
+                                }
+                            }
+                            let unk_d =
+                                summarize_unknown_fields(info.special_fields().unknown_fields());
+                            if !unk_d.is_empty() {
+                                println!("  device_info unknown_fields = {unk_d:?}");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Cluster parse failed: {e}"),
+                },
+                Err(e) => eprintln!("put_connect_state_request failed: {e}"),
+            }
+            let _ = session.spclient().delete_connect_state_request().await;
+        }
+    }
+
+    let Some((playlist_id, canonical_playlist_uri)) = playlist_id_and_uri else {
+        return;
+    };
 
     if let Some(ref dir) = save_fixtures {
         fs::create_dir_all(dir).expect("create fixture dir");

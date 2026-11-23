@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use crate::{
-    core::Error,
-    protocol::{player::ProvidedTrack, transfer_state::TransferState},
+    core::{Error, SpotifyId, SpotifyUri},
+    protocol::{context_track::ContextTrack, player::ProvidedTrack, transfer_state::TransferState},
     state::{
         context::ContextType,
         metadata::Metadata,
@@ -10,6 +12,32 @@ use crate::{
     },
 };
 use protobuf::MessageField;
+
+fn is_transfer_mix_key(key: &str) -> bool {
+    key.starts_with("audio.fade_") || key.starts_with("automix.")
+}
+
+fn context_track_canonical_uri(track: &ContextTrack) -> Option<String> {
+    if let Some(uri) = track.uri.as_ref().filter(|u| !u.is_empty()) {
+        return Some(uri.clone());
+    }
+    let gid = track.gid.as_ref().filter(|g| !g.is_empty())?;
+    let id = SpotifyId::from_raw(gid).ok()?;
+    Some(SpotifyUri::Track { id }.to_uri())
+}
+
+fn insert_mix_metadata(target: &mut HashMap<String, String>, source: &HashMap<String, String>) {
+    for (k, v) in source {
+        if is_transfer_mix_key(k) && !v.is_empty() {
+            match target.get(k) {
+                Some(existing) if !existing.is_empty() => {}
+                _ => {
+                    target.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+}
 
 impl ConnectState {
     pub fn current_track_from_transfer(
@@ -82,9 +110,9 @@ impl ConnectState {
 
             initial_track = session.context.get_initial_track().cloned();
 
-            if let Some(mut ctx) = session.context.take() {
+            if let Some(ctx) = session.context.as_mut() {
                 player.restrictions = ctx.restrictions.take().map(Into::into).into();
-                for (key, value) in ctx.metadata {
+                for (key, value) in ctx.metadata.drain() {
                     player.context_metadata.insert(key, value);
                 }
             }
@@ -132,6 +160,10 @@ impl ConnectState {
 
         self.set_active_context(context_ty);
         self.fill_up_context = context_ty;
+
+        // Preserve pre-computed `audio.fade_*` / `automix.*` track metadata from the
+        // transferring client across `/context-resolve` refreshes.
+        self.merge_transfer_mix_metadata(&transfer);
 
         let ctx = self.get_context(self.active_context)?;
 
@@ -195,5 +227,186 @@ impl ConnectState {
         self.update_restrictions();
 
         Ok(())
+    }
+
+    /// Merge `audio.fade_*` and `automix.*` per-track metadata sent inside `TransferState`
+    /// onto the freshly resolved context tracks and current track without overwriting
+    /// non-empty keys returned by `/context-resolve`.
+    fn merge_transfer_mix_metadata(&mut self, transfer: &TransferState) {
+        let mut by_uid: HashMap<&str, &HashMap<String, String>> = HashMap::new();
+        let mut by_uri: HashMap<String, &HashMap<String, String>> = HashMap::new();
+
+        let transferred_tracks = transfer.playback.current_track.as_ref().into_iter().chain(
+            transfer
+                .current_session
+                .as_ref()
+                .and_then(|s| s.context.as_ref())
+                .into_iter()
+                .flat_map(|ctx| ctx.pages.iter())
+                .flat_map(|page| page.tracks.iter()),
+        );
+
+        for track in transferred_tracks {
+            if !track
+                .metadata
+                .iter()
+                .any(|(k, v)| is_transfer_mix_key(k) && !v.is_empty())
+            {
+                continue;
+            }
+            if let Some(uid) = track.uid.as_deref().filter(|u| !u.is_empty()) {
+                by_uid.entry(uid).or_insert(&track.metadata);
+            }
+            if let Some(uri) = context_track_canonical_uri(track) {
+                by_uri.entry(uri).or_insert(&track.metadata);
+            }
+        }
+
+        if by_uid.is_empty() && by_uri.is_empty() {
+            return;
+        }
+
+        if let Ok(ctx) = self.get_context_mut(self.active_context) {
+            for idx in 0..ctx.tracks.len() {
+                if let Some(track) = ctx.tracks.get_mut(idx) {
+                    if let Some(src) = by_uid
+                        .get(track.uid.as_str())
+                        .copied()
+                        .or_else(|| by_uri.get(&track.uri).copied())
+                    {
+                        insert_mix_metadata(&mut track.metadata, src);
+                    }
+                }
+            }
+        }
+
+        if let Some(current) = self.player_mut().track.as_mut() {
+            if let Some(src) = by_uid
+                .get(current.uid.as_str())
+                .copied()
+                .or_else(|| by_uri.get(&current.uri).copied())
+            {
+                insert_mix_metadata(&mut current.metadata, src);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{
+        connect::Device, context::Context, context_page::ContextPage, playback::Playback,
+        player::PlayerState, session::Session,
+    };
+
+    #[test]
+    fn transfer_preserves_audio_fade_metadata_without_clobbering_resolved_recipes() {
+        let mut transfer = TransferState::new();
+        let mut tr_a = ContextTrack {
+            uri: Some("spotify:track:6kPXvN6u28Ku8xcHtpL0yV".to_string()),
+            uid: Some("uid-a".to_string()),
+            ..Default::default()
+        };
+        tr_a.metadata.insert(
+            "audio.fade_out_start_time".to_string(),
+            "170444".to_string(),
+        );
+        tr_a.metadata
+            .insert("audio.fade_out_duration".to_string(), "26483".to_string());
+        tr_a.metadata.insert(
+            "automix.auto_transition_recipe".to_string(),
+            "stale-transfer-val".to_string(),
+        );
+
+        let mut tr_b = ContextTrack {
+            uri: Some("spotify:track:685if6yGqGm0P88BoJrOiL".to_string()),
+            uid: Some("uid-b".to_string()),
+            ..Default::default()
+        };
+        tr_b.metadata
+            .insert("audio.fade_in_start_time".to_string(), "12800".to_string());
+        tr_b.metadata
+            .insert("audio.fade_overlap".to_string(), "26483".to_string());
+
+        transfer.playback = MessageField::some(Playback {
+            current_track: MessageField::some(tr_a.clone()),
+            ..Default::default()
+        });
+        transfer.current_session = MessageField::some(Session {
+            context: MessageField::some(Context {
+                uri: Some("spotify:playlist:test".to_string()),
+                pages: vec![ContextPage {
+                    tracks: vec![tr_a, tr_b],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut state = ConnectState::default();
+        state.request.device = MessageField::some(Device {
+            player_state: MessageField::some(PlayerState::new()),
+            ..Default::default()
+        });
+        state.handle_initial_transfer(&mut transfer, Some("spotify:playlist:test".to_string()));
+        // Pages must still be present on `transfer` after `handle_initial_transfer`.
+        assert_eq!(transfer.current_session.context.pages.len(), 1);
+
+        // Simulate `/context-resolve` populating fresh tracks without `audio.fade_*`.
+        let mut resolved_a = ContextTrack {
+            uri: Some("spotify:track:6kPXvN6u28Ku8xcHtpL0yV".to_string()),
+            uid: Some("uid-a".to_string()),
+            ..Default::default()
+        };
+        resolved_a.metadata.insert(
+            "automix.auto_transition_recipe".to_string(),
+            "fresh-resolved-recipe".to_string(),
+        );
+        let resolved_b = ContextTrack {
+            uri: Some("spotify:track:685if6yGqGm0P88BoJrOiL".to_string()),
+            uid: Some("uid-b".to_string()),
+            ..Default::default()
+        };
+        let resolved_ctx = Context {
+            uri: Some("spotify:playlist:test".to_string()),
+            pages: vec![ContextPage {
+                tracks: vec![resolved_a, resolved_b],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        state
+            .update_context(resolved_ctx, ContextType::Default)
+            .expect("update_context");
+        state.finish_transfer(transfer).expect("finish_transfer");
+
+        let ctx = state.get_context(ContextType::Default).unwrap();
+        let a = ctx.tracks.get(0).unwrap();
+        let b = ctx.tracks.get(1).unwrap();
+        assert_eq!(
+            a.metadata
+                .get("audio.fade_out_start_time")
+                .map(String::as_str),
+            Some("170444")
+        );
+        assert_eq!(
+            a.metadata
+                .get("automix.auto_transition_recipe")
+                .map(String::as_str),
+            Some("fresh-resolved-recipe"),
+            "fresh /context-resolve recipe must not be overwritten"
+        );
+        assert_eq!(
+            b.metadata
+                .get("audio.fade_in_start_time")
+                .map(String::as_str),
+            Some("12800")
+        );
+        assert_eq!(
+            b.metadata.get("audio.fade_overlap").map(String::as_str),
+            Some("26483")
+        );
     }
 }

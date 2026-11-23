@@ -18,8 +18,8 @@ pub(crate) use driver::{
 };
 pub use engine::TransitionProcessor;
 pub use spec::{
-    AutomationCurve, AutomationCurves, BeatGrid, BeatMarker, CurvePoint, DeckCurves, EqTopology,
-    FilterMode, InterpolationSegment, SegmentEasing, SegmentInterpolation, SpecialCase,
-    SpecialResult, SpecialRole, TempoPlan, TimeStretchMode, TransitionSpec, ValueMapping,
-    ValueSemantics, ValueUnit,
+    AutomationCurve, AutomationCurves, BeatGrid, BeatMarker, CurveInterpolation, CurvePoint,
+    DeckCurves, EqTopology, FilterMode, InterpolationSegment, SegmentEasing, SegmentInterpolation,
+    SpecialCase, SpecialResult, SpecialRole, TempoPlan, TimeStretchMode, TransitionSpec,
+    ValueMapping, ValueSemantics, ValueUnit,
 };
