@@ -77,6 +77,23 @@ impl Deref for AudioPacketPosition {
 pub trait AudioDecoder {
     fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError>;
     fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>>;
+
+    /// Seek to an exact PCM frame index at [`crate::SAMPLE_RATE`].
+    ///
+    /// Returns the actual frame index positioned at. Decoders that do not
+    /// support sample-accurate seeking (such as passthrough decoders) fall
+    /// back to millisecond seeking.
+    fn seek_exact(&mut self, target_frame: u64) -> Result<u64, DecoderError> {
+        let position_ms = ((target_frame as f64) * crate::MS_PER_PAGE).round() as u32;
+        let actual_ms = self.seek(position_ms)?;
+        Ok(((actual_ms as f64) * crate::PAGES_PER_MS).round() as u64)
+    }
+
+    /// Current stream position in PCM frames at [`crate::SAMPLE_RATE`] (the
+    /// frame index of the next sample to be returned by [`Self::next_packet`]).
+    fn position_frames(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl From<DecoderError> for librespot_core::error::Error {

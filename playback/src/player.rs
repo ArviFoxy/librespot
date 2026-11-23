@@ -68,6 +68,126 @@ pub enum SinkStatus {
 
 pub type SinkEventCallback = Box<dyn Fn(SinkStatus) + Send>;
 
+/// Per-track loudness normalisation applied before any dual-deck summing.
+#[inline]
+pub(crate) fn apply_track_normalisation(
+    data: &mut [f64],
+    config: &PlayerConfig,
+    normalisation_factor: f64,
+) {
+    if !config.normalisation {
+        return;
+    }
+
+    match config.normalisation_method {
+        NormalisationMethod::Dynamic => {
+            for sample in data.iter_mut() {
+                *sample *= normalisation_factor;
+            }
+        }
+        NormalisationMethod::Basic => {
+            if normalisation_factor < 1.0 {
+                for sample in data.iter_mut() {
+                    *sample *= normalisation_factor;
+                }
+            }
+        }
+    }
+}
+
+/// Stereo-coupled feedforward dynamic soft-knee limiter (Giannoulis et al., 2012)
+/// and master volume stage applied after track decoding / mixing.
+pub(crate) struct MasterLimiter {
+    integrators: [f64; 2],
+    peaks: [f64; 2],
+    channel: usize,
+    knee_factor: f64,
+}
+
+impl MasterLimiter {
+    pub(crate) fn new(config: &PlayerConfig) -> Self {
+        Self {
+            integrators: [0.0; 2],
+            peaks: [0.0; 2],
+            channel: 0,
+            knee_factor: 1.0 / (8.0 * config.normalisation_knee_db),
+        }
+    }
+
+    pub(crate) fn process_post_mix(
+        &mut self,
+        data: &mut [f64],
+        config: &PlayerConfig,
+        volume: f64,
+    ) {
+        match (config.normalisation, config.normalisation_method) {
+            (true, NormalisationMethod::Dynamic) => {
+                let threshold_db = config.normalisation_threshold_dbfs;
+                let knee_db = config.normalisation_knee_db;
+                let attack_cf = config.normalisation_attack_cf;
+                let release_cf = config.normalisation_release_cf;
+
+                for sample in data.iter_mut() {
+                    // Feedforward limiter in the log domain
+                    // After: Giannoulis, D., Massberg, M., & Reiss, J.D. (2012).
+                    // Digital Dynamic Range Compressor Design—A Tutorial and
+                    // Analysis. Journal of The Audio Engineering Society, 60,
+                    // 399-408.
+                    //
+                    // Assumes interleaved stereo audio.
+
+                    // step 1-4: half-wave rectification and conversion into dB, and
+                    // gain computer with soft knee and subtractor
+                    let limiter_db = {
+                        // Add slight DC offset. Some samples are silence, which is
+                        // -inf dB and gets the limiter stuck. Adding a small
+                        // positive offset prevents this.
+                        *sample += f64::MIN_POSITIVE;
+
+                        let bias_db = ratio_to_db(sample.abs()) - threshold_db;
+                        let knee_boundary_db = bias_db * 2.0;
+                        if knee_boundary_db < -knee_db {
+                            0.0
+                        } else if knee_boundary_db.abs() <= knee_db {
+                            let term = knee_boundary_db + knee_db;
+                            term * term * self.knee_factor
+                        } else {
+                            bias_db
+                        }
+                    };
+
+                    // track left/right channel
+                    let channel = self.channel;
+                    self.channel ^= 1;
+
+                    // step 5: smooth, decoupled peak detector for each channel
+                    let integrator = &mut self.integrators[channel];
+                    let peak = &mut self.peaks[channel];
+
+                    *integrator = f64::max(
+                        limiter_db,
+                        release_cf * *integrator + (1.0 - release_cf) * limiter_db,
+                    );
+                    *peak = attack_cf * *peak + (1.0 - attack_cf) * *integrator;
+
+                    // steps 6-8: conversion into level and multiplication into gain
+                    // stage. Find maximum peak across both channels to couple the
+                    // gain and maintain stereo imaging.
+                    let max_peak = f64::max(self.peaks[0], self.peaks[1]);
+                    *sample *= db_to_ratio(-max_peak) * volume;
+                }
+            }
+            (false, _) | (true, NormalisationMethod::Basic) => {
+                if volume < 1.0 {
+                    for sample in data.iter_mut() {
+                        *sample *= volume;
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct PlayerInternal {
     session: Session,
     config: PlayerConfig,
@@ -83,10 +203,7 @@ struct PlayerInternal {
     event_senders: Vec<mpsc::UnboundedSender<PlayerEvent>>,
     converter: Converter,
 
-    normalisation_integrators: [f64; 2],
-    normalisation_peaks: [f64; 2],
-    normalisation_channel: usize,
-    normalisation_knee_factor: f64,
+    master_limiter: MasterLimiter,
 
     auto_normalise_as_album: bool,
 
@@ -495,7 +612,7 @@ impl Player {
             debug!("new Player [{player_id}]");
 
             let converter = Converter::new(config.ditherer);
-            let normalisation_knee_factor = 1.0 / (8.0 * config.normalisation_knee_db);
+            let master_limiter = MasterLimiter::new(&config);
 
             // TODO: it would be neat if we could watch for added or modified files in the
             // specified directories, and dynamically update the lookup. Currently, a new player
@@ -518,10 +635,7 @@ impl Player {
                 event_senders: vec![],
                 converter,
 
-                normalisation_peaks: [0.0; 2],
-                normalisation_integrators: [0.0; 2],
-                normalisation_channel: 0,
-                normalisation_knee_factor,
+                master_limiter,
 
                 auto_normalise_as_album: false,
 
@@ -1787,92 +1901,9 @@ impl PlayerInternal {
                         // this will always be 1.0 (no change).
                         let volume = self.volume_getter.attenuation_factor();
 
-                        // For the basic normalisation method, a normalisation factor of 1.0
-                        // indicates that there is nothing to normalise (all samples should pass
-                        // unaltered). For the dynamic method, there may still be peaks that we
-                        // want to shave off.
-                        //
-                        // No matter the case we apply volume attenuation last if there is any.
-                        match (self.config.normalisation, self.config.normalisation_method) {
-                            (false, _) => {
-                                if volume < 1.0 {
-                                    for sample in data.iter_mut() {
-                                        *sample *= volume;
-                                    }
-                                }
-                            }
-                            (true, NormalisationMethod::Dynamic) => {
-                                // zero-cost shorthands
-                                let threshold_db = self.config.normalisation_threshold_dbfs;
-                                let knee_db = self.config.normalisation_knee_db;
-                                let attack_cf = self.config.normalisation_attack_cf;
-                                let release_cf = self.config.normalisation_release_cf;
-
-                                for sample in data.iter_mut() {
-                                    // Feedforward limiter in the log domain
-                                    // After: Giannoulis, D., Massberg, M., & Reiss, J.D. (2012).
-                                    // Digital Dynamic Range Compressor Design—A Tutorial and
-                                    // Analysis. Journal of The Audio Engineering Society, 60,
-                                    // 399-408.
-
-                                    // This implementation assumes audio is stereo.
-
-                                    // step 0: apply gain stage
-                                    *sample *= normalisation_factor;
-
-                                    // step 1-4: half-wave rectification and conversion into dB, and
-                                    // gain computer with soft knee and subtractor
-                                    let limiter_db = {
-                                        // Add slight DC offset. Some samples are silence, which is
-                                        // -inf dB and gets the limiter stuck. Adding a small
-                                        // positive offset prevents this.
-                                        *sample += f64::MIN_POSITIVE;
-
-                                        let bias_db = ratio_to_db(sample.abs()) - threshold_db;
-                                        let knee_boundary_db = bias_db * 2.0;
-                                        if knee_boundary_db < -knee_db {
-                                            0.0
-                                        } else if knee_boundary_db.abs() <= knee_db {
-                                            let term = knee_boundary_db + knee_db;
-                                            term * term * self.normalisation_knee_factor
-                                        } else {
-                                            bias_db
-                                        }
-                                    };
-
-                                    // track left/right channel
-                                    let channel = self.normalisation_channel;
-                                    self.normalisation_channel ^= 1;
-
-                                    // step 5: smooth, decoupled peak detector for each channel
-                                    // Use direct references to reduce repeated array indexing
-                                    let integrator = &mut self.normalisation_integrators[channel];
-                                    let peak = &mut self.normalisation_peaks[channel];
-
-                                    *integrator = f64::max(
-                                        limiter_db,
-                                        release_cf * *integrator + (1.0 - release_cf) * limiter_db,
-                                    );
-                                    *peak = attack_cf * *peak + (1.0 - attack_cf) * *integrator;
-
-                                    // steps 6-8: conversion into level and multiplication into gain
-                                    // stage. Find maximum peak across both channels to couple the
-                                    // gain and maintain stereo imaging.
-                                    let max_peak = f64::max(
-                                        self.normalisation_peaks[0],
-                                        self.normalisation_peaks[1],
-                                    );
-                                    *sample *= db_to_ratio(-max_peak) * volume;
-                                }
-                            }
-                            (true, NormalisationMethod::Basic) => {
-                                if normalisation_factor < 1.0 || volume < 1.0 {
-                                    for sample in data.iter_mut() {
-                                        *sample *= normalisation_factor * volume;
-                                    }
-                                }
-                            }
-                        }
+                        apply_track_normalisation(data, &self.config, normalisation_factor);
+                        self.master_limiter
+                            .process_post_mix(data, &self.config, volume);
                     }
 
                     if let Err(e) = self.sink.write(packet, &mut self.converter) {
@@ -2707,5 +2738,126 @@ where
 
     fn byte_len(&self) -> Option<u64> {
         Some(self.length)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SAMPLE_RATE;
+
+    #[test]
+    fn split_dynamic_limiter_matches_fused_reference_bit_for_bit() {
+        let config = PlayerConfig {
+            normalisation: true,
+            normalisation_method: NormalisationMethod::Dynamic,
+            ..Default::default()
+        };
+        let factor = db_to_ratio(-3.5);
+        let volume = 0.75;
+
+        let input: Vec<f64> = (0..4096)
+            .map(|i| {
+                let t = (i / 2) as f64 / f64::from(SAMPLE_RATE);
+                let freq = if i % 2 == 0 { 440.0 } else { 660.0 };
+                1.4 * (2.0 * std::f64::consts::PI * freq * t).sin()
+            })
+            .collect();
+
+        // Reference fused loop matching the pre-split implementation
+        let mut reference = input.clone();
+        let knee_factor = 1.0 / (8.0 * config.normalisation_knee_db);
+        let mut integrators = [0.0_f64; 2];
+        let mut peaks = [0.0_f64; 2];
+        let mut channel = 0usize;
+        for sample in &mut reference {
+            *sample *= factor;
+            let limiter_db = {
+                *sample += f64::MIN_POSITIVE;
+                let bias_db = ratio_to_db(sample.abs()) - config.normalisation_threshold_dbfs;
+                let knee_boundary_db = bias_db * 2.0;
+                if knee_boundary_db < -config.normalisation_knee_db {
+                    0.0
+                } else if knee_boundary_db.abs() <= config.normalisation_knee_db {
+                    let term = knee_boundary_db + config.normalisation_knee_db;
+                    term * term * knee_factor
+                } else {
+                    bias_db
+                }
+            };
+            let ch = channel;
+            channel ^= 1;
+            integrators[ch] = f64::max(
+                limiter_db,
+                config.normalisation_release_cf * integrators[ch]
+                    + (1.0 - config.normalisation_release_cf) * limiter_db,
+            );
+            peaks[ch] = config.normalisation_attack_cf * peaks[ch]
+                + (1.0 - config.normalisation_attack_cf) * integrators[ch];
+            let max_peak = f64::max(peaks[0], peaks[1]);
+            *sample *= db_to_ratio(-max_peak) * volume;
+        }
+
+        let mut split = input;
+        apply_track_normalisation(&mut split, &config, factor);
+        let mut limiter = MasterLimiter::new(&config);
+        limiter.process_post_mix(&mut split, &config, volume);
+
+        assert_eq!(split.len(), reference.len());
+        for (idx, (a, b)) in split.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "sample {idx} diverged: split={a} ref={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_mix_limiter_bounds_overlapping_full_scale_tracks() {
+        let config = PlayerConfig {
+            normalisation: true,
+            normalisation_method: NormalisationMethod::Dynamic,
+            normalisation_threshold_dbfs: -2.0,
+            ..Default::default()
+        };
+
+        // Two overlapping tracks, each hitting 0 dBFS, summed into a +6 dBFS signal.
+        let n_frames = SAMPLE_RATE as usize; // 1 second
+        let mut deck_a = vec![0.0_f64; n_frames * 2];
+        let mut deck_b = vec![0.0_f64; n_frames * 2];
+        for i in 0..n_frames {
+            let t = i as f64 / f64::from(SAMPLE_RATE);
+            let a = (2.0 * std::f64::consts::PI * 100.0 * t).sin();
+            let b = (2.0 * std::f64::consts::PI * 100.0 * t).sin();
+            deck_a[2 * i] = a;
+            deck_a[2 * i + 1] = a;
+            deck_b[2 * i] = b;
+            deck_b[2 * i + 1] = b;
+        }
+
+        apply_track_normalisation(&mut deck_a, &config, 1.0);
+        apply_track_normalisation(&mut deck_b, &config, 1.0);
+
+        let mut mixed: Vec<f64> = deck_a
+            .iter()
+            .zip(deck_b.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+
+        let mut limiter = MasterLimiter::new(&config);
+        limiter.process_post_mix(&mut mixed, &config, 1.0);
+
+        assert!(mixed.iter().all(|s| s.is_finite()));
+        // After the 5 ms attack settles, steady-state peaks must sit near or below -2 dBFS.
+        let settle_samples = (SAMPLE_RATE as usize / 20) * 2; // 50 ms
+        let steady_peak = mixed[settle_samples..]
+            .iter()
+            .fold(0.0_f64, |acc, &s| acc.max(s.abs()));
+        let steady_peak_db = ratio_to_db(steady_peak);
+        assert!(
+            steady_peak_db <= config.normalisation_threshold_dbfs + 0.5,
+            "post-mix steady peak {steady_peak_db:.2} dBFS exceeded limiter ceiling"
+        );
     }
 }
