@@ -16,7 +16,7 @@ use crate::{
         MixConfig, MixMode,
         presets::{
             BuiltinPreset, bipolar_eq_semantics, bipolar_resonance_semantics,
-            curves_for_builtin_preset, curves_from_proto_preset,
+            curves_for_builtin_preset, curves_from_proto_preset_with_hint,
         },
     },
     playback::{
@@ -298,20 +298,20 @@ pub fn transition_proto_to_spec(
         return None;
     }
 
-    let (out_curves, in_curves, handoff_fraction) = proto
-        .preset
-        .as_ref()
-        .map(curves_from_proto_preset)
-        .unwrap_or_else(|| {
-            let (o, i) = curves_for_builtin_preset(BuiltinPreset::BassSwap);
-            (o, i, BuiltinPreset::BassSwap.handoff_fraction())
-        });
-
     let want_beatmatch = match proto.beatmatch_preference.enum_value_or_default() {
         BeatmatchPreference::BEATMATCH_PREFERENCE_OFF => false,
         BeatmatchPreference::BEATMATCH_PREFERENCE_ON => true,
         BeatmatchPreference::BEATMATCH_PREFERENCE_AUTO => overlap.is_beatmatched,
     };
+
+    let (out_curves, in_curves, handoff_fraction) = proto
+        .preset
+        .as_ref()
+        .map(|p| curves_from_proto_preset_with_hint(p, want_beatmatch))
+        .unwrap_or_else(|| {
+            let (o, i) = curves_for_builtin_preset(BuiltinPreset::BassSwap);
+            (o, i, BuiltinPreset::BassSwap.handoff_fraction())
+        });
 
     let scale_bpm = |raw: f64, speed_opt: Option<f32>, item_speed: f64| -> f64 {
         let mut s = 1.0;

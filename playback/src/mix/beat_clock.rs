@@ -189,6 +189,73 @@ impl BeatClock {
         self.beat_pos += dt_sec * bpm_mid / 60.0;
     }
 
+    /// Return `true` if either deck requires non-unity time-stretching across the
+    /// overlap to keep beat phase error within `4 ms`.
+    ///
+    /// Same-BPM quantized transitions (e.g., `174.0 -> 174.0 BPM` DnB or `128.0 -> 128.0 BPM`
+    /// house) return `false` so [`crate::mix::TransitionProcessor`] can bypass the spectral
+    /// stretcher for bit-clean transients and lower CPU usage while keeping exact beat timing.
+    pub fn needs_time_stretch(&self) -> bool {
+        if !self.beatmatched {
+            return false;
+        }
+        const MAX_PHASE_DRIFT_SEC: f64 = 0.004;
+        let dur_sec = self.total_beats * 60.0 / self.bpm_a;
+        let nominal_drift = ((self.bpm_b_effective / self.bpm_a) - 1.0).abs() * dur_sec;
+        if nominal_drift > MAX_PHASE_DRIFT_SEC {
+            return true;
+        }
+
+        let octave_scale = |grid: &BeatGrid, start_idx: f64| -> f64 {
+            let Some(raw_bpm) = local_grid_bpm(grid, start_idx) else {
+                return 1.0;
+            };
+            let ratio = raw_bpm / self.bpm_a;
+            if (ratio - 0.5).abs() < 0.1 {
+                0.5
+            } else if (ratio - 2.0).abs() < 0.25 {
+                2.0
+            } else {
+                1.0
+            }
+        };
+        let scale_a = self
+            .beats_a
+            .as_ref()
+            .map(|g| octave_scale(g, self.start_a_beat_idx))
+            .unwrap_or(1.0);
+        let scale_b = self
+            .beats_b
+            .as_ref()
+            .map(|g| octave_scale(g, self.start_b_beat_idx))
+            .unwrap_or(1.0);
+
+        for step in 1..=4 {
+            let beat_offset = (step as f64 / 4.0) * self.total_beats;
+            let expected_dt = beat_offset * 60.0 / self.bpm_a;
+            let dt_a = self
+                .beats_a
+                .as_ref()
+                .and_then(|g| beat_index_to_time(g, self.start_a_beat_idx + beat_offset * scale_a))
+                .map(|t| t - self.start_a_sec)
+                .unwrap_or(expected_dt);
+            let dt_b = self
+                .beats_b
+                .as_ref()
+                .and_then(|g| beat_index_to_time(g, self.start_b_beat_idx + beat_offset * scale_b))
+                .map(|t| t - self.start_b_sec)
+                .unwrap_or(beat_offset * 60.0 / self.bpm_b_effective);
+
+            if (dt_a - expected_dt).abs() > MAX_PHASE_DRIFT_SEC
+                || (dt_b - expected_dt).abs() > MAX_PHASE_DRIFT_SEC
+                || (dt_a - dt_b).abs() > MAX_PHASE_DRIFT_SEC
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Analytical wall-clock duration in output frames for a linear BPM ramp over `total_beats`:
     /// `D = integral_0^B (60 / (bpm_a + (bpm_b - bpm_a) * b / B)) db`.
     pub fn expected_output_frames(&self) -> u64 {
@@ -290,5 +357,55 @@ mod tests {
         let (ra1, rb1) = clock.deck_ratios();
         assert!((ra1 - 150.0 / 145.0).abs() < 1e-6);
         assert!((rb1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn needs_time_stretch_bypasses_identity_bpm_and_catches_subtle_drift() {
+        // Exact same BPM (174 -> 174 over 16 bars / 64 beats) needs zero stretching.
+        let same = TempoPlan::beatmatched(174.0, 174.0);
+        let clock_same = BeatClock::new(0, 0, 0, Some(64.0), Some(&same));
+        assert!(!clock_same.needs_time_stretch());
+
+        // Exact half-time octave match (174 -> 87) also needs zero stretching.
+        let halftime = TempoPlan::beatmatched(174.0, 87.0);
+        let clock_ht = BeatClock::new(0, 0, 0, Some(64.0), Some(&halftime));
+        assert!(!clock_ht.needs_time_stretch());
+
+        // Subtle 0.4 BPM mismatch over 22 s accumulates ~50 ms phase drift (> 4 ms) -> must stretch.
+        let drift = TempoPlan::beatmatched(174.0, 174.4);
+        let clock_drift = BeatClock::new(0, 0, 0, Some(64.0), Some(&drift));
+        assert!(clock_drift.needs_time_stretch());
+
+        // Tempo ramp (145 -> 150 BPM) -> must stretch.
+        let ramp = TempoPlan::beatmatched(145.0, 150.0);
+        let clock_ramp = BeatClock::new(0, 0, 0, Some(32.0), Some(&ramp));
+        assert!(clock_ramp.needs_time_stretch());
+
+        // Same nominal BPM with mid-transition live-drummer swing (20 ms offset) -> must stretch.
+        let dt = 60.0 / 128.0;
+        let beats_steady: Vec<super::super::spec::BeatMarker> = (0..40)
+            .map(|i| super::super::spec::BeatMarker {
+                time_sec: i as f64 * dt,
+                duration_sec: dt,
+                beat_in_bar: (i as u32 % 4) + 1,
+                beat_confidence: 0.9,
+                downbeat_confidence: 0.9,
+            })
+            .collect();
+        let mut beats_swing = beats_steady.clone();
+        for b in &mut beats_swing[8..24] {
+            b.time_sec += 0.020; // 20 ms swing at midpoint
+        }
+        let mut live_plan = TempoPlan::beatmatched(128.0, 128.0);
+        live_plan.beats_a = Some(BeatGrid {
+            beats_per_bar: 4,
+            beats: beats_steady,
+        });
+        live_plan.beats_b = Some(BeatGrid {
+            beats_per_bar: 4,
+            beats: beats_swing,
+        });
+        let clock_live = BeatClock::new(0, 0, 0, Some(32.0), Some(&live_plan));
+        assert!(clock_live.needs_time_stretch());
     }
 }

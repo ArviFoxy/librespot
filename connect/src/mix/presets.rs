@@ -166,13 +166,36 @@ pub fn curves_for_builtin_preset(preset: BuiltinPreset) -> (DeckCurves, DeckCurv
 /// Resolve a Spotify [`Preset`] (base preset ID + optional style overrides + optional custom
 /// user-drawn curves) into `(outgoing_curves, incoming_curves, handoff_fraction)`.
 pub fn curves_from_proto_preset(preset: &Preset) -> (DeckCurves, DeckCurves, f64) {
+    curves_from_proto_preset_with_hint(preset, false)
+}
+
+/// Like [`curves_from_proto_preset`], with an optional `is_beatmatched` hint from `Overlap`.
+///
+/// Newer mobile preset IDs (e.g. `18`, `19`) can arrive with `Preset.type == UNSPECIFIED` and
+/// explicit EQ/filter style overrides while expecting full-overlap volume curves rather than a
+/// `-3 dB` equal-power fade. When `preset.id` is unknown and `type` is unspecified, beatmatched
+/// or EQ/filter-overridden presets default to [`BuiltinPreset::BassSwap`] (full overlap).
+pub fn curves_from_proto_preset_with_hint(
+    preset: &Preset,
+    is_beatmatched: bool,
+) -> (DeckCurves, DeckCurves, f64) {
     let base = BuiltinPreset::from_id(preset.id).unwrap_or_else(|| {
         match preset.type_.enum_value_or_default() {
             PresetType::PRESET_TYPE_CUT | PresetType::PRESET_TYPE_BEATMATCHED_CUT => {
                 BuiltinPreset::SimpleCut
             }
             PresetType::PRESET_TYPE_BEATMATCHED_FADE => BuiltinPreset::BassSwap,
-            _ => BuiltinPreset::SimpleFade,
+            PresetType::PRESET_TYPE_FADE => BuiltinPreset::SimpleFade,
+            PresetType::PRESET_TYPE_UNSPECIFIED => {
+                if is_beatmatched
+                    || preset.eq_style_override.is_some()
+                    || preset.filter_fx_style_override.is_some()
+                {
+                    BuiltinPreset::BassSwap
+                } else {
+                    BuiltinPreset::SimpleFade
+                }
+            }
         }
     });
 
@@ -911,5 +934,39 @@ mod tests {
         let raw_end = eval_curves(out.eq_low.as_ref().unwrap(), 1.0).unwrap();
         let gain_end = apply_semantics(raw_end, sem).as_linear_gain().unwrap();
         assert!((gain_end - 0.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn unknown_beatmatched_preset_with_eq_filter_overrides_uses_full_overlap_volume() {
+        use crate::protocol::transition::{EqStyle, FilterFxStyle};
+
+        // Mirrors real Spotify mobile recipes (`preset.id = 19`, `type = UNSPECIFIED`,
+        // `eq_style_override = 4` Bass Swap, `filter_fx_style_override = 6` HP-out).
+        let preset = Preset {
+            id: 19,
+            eq_style_override: MessageField::some(EqStyle {
+                id: 4,
+                ..Default::default()
+            }),
+            filter_fx_style_override: MessageField::some(FilterFxStyle {
+                id: 6,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (out, inc, _handoff) = curves_from_proto_preset_with_hint(&preset, true);
+        // Full-overlap volume holds 1.0 unity on BOTH decks at midpoint (no -3 dB dip).
+        assert!(
+            (eval_curves(out.volume.as_ref().unwrap(), 0.5).unwrap() - 1.0).abs() < 1e-6,
+            "outgoing volume must hold unity at midpoint"
+        );
+        assert!(
+            (eval_curves(inc.volume.as_ref().unwrap(), 0.5).unwrap() - 1.0).abs() < 1e-6,
+            "incoming volume must hold unity at midpoint"
+        );
+        assert!(out.eq_low.is_some());
+        assert!(inc.eq_low.is_some());
+        assert!(out.filter_cutoff.is_some());
     }
 }

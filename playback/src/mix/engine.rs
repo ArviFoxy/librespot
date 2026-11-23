@@ -252,7 +252,7 @@ impl TransitionProcessor {
             spec.duration_beats,
             spec.tempo.as_ref(),
         );
-        let stretch_mode = if clock.beatmatched {
+        let stretch_mode = if clock.needs_time_stretch() {
             spec.tempo
                 .as_ref()
                 .map(|t| t.stretch_mode)
@@ -260,7 +260,11 @@ impl TransitionProcessor {
         } else {
             TimeStretchMode::Off
         };
-        let (r_a0, r_b0) = clock.deck_ratios();
+        let (r_a0, r_b0) = if stretch_mode != TimeStretchMode::Off {
+            clock.deck_ratios()
+        } else {
+            (1.0, 1.0)
+        };
 
         let deck_a = DeckChain::new(
             stretch_mode,
@@ -530,7 +534,7 @@ impl TransitionProcessor {
 
             // Closed-loop feedforward + proportional beat-phase servo: cancels hop-quantization
             // drift so Deck A and Deck B stay phase-locked across arbitrary transition lengths.
-            if self.clock.beatmatched {
+            if self.clock.beatmatched && self.stretch_mode != TimeStretchMode::Off {
                 let (ff_a, ff_b) = self.clock.deck_ratios();
                 let (target_a, target_b) = self.clock.expected_source_frames();
                 let err_a = target_a - self.deck_a.playback_source_frame();
@@ -1205,6 +1209,54 @@ mod tests {
         assert!(
             splice_step < 0.03,
             "click at exit handoff splice: last={last_l:.5} next={next_l:.5} step={splice_step:.5}"
+        );
+    }
+
+    #[test]
+    fn identity_bpm_beatmatched_mix_bypasses_stft_and_preserves_crest_factor() {
+        // Brickwall-limited +/-0.5 square-ish pulse (crest factor ~0 dB). Passing through an
+        // unnecessary 1.0x STFT stretcher would smear phase and inflate peak amplitude; bypassing
+        // the stretcher when bpm_a == bpm_b keeps peaks bit-clean at 0.5.
+        let n_frames = SAMPLE_RATE as usize * 3;
+        let mut a = vec![0.0_f64; n_frames * 2];
+        let mut b = vec![0.0_f64; n_frames * 2];
+        for i in 0..n_frames {
+            let sq = if (i / 100) % 2 == 0 { 0.5 } else { -0.5 };
+            a[2 * i] = sq;
+            a[2 * i + 1] = sq;
+            b[2 * i] = 0.0;
+            b[2 * i + 1] = 0.0;
+        }
+        let flat_one = AutomationCurves {
+            curves: vec![AutomationCurve::linear(
+                vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 1.0 }],
+                0.0,
+                1.0,
+            )],
+            minimum: 0.0,
+            maximum: 1.0,
+        };
+        let mut spec = TransitionSpec::equal_power_crossfade(0, 0, SAMPLE_RATE as u64 * 2);
+        spec.duration_beats = Some(8.0);
+        spec.tempo = Some(TempoPlan::beatmatched(174.0, 174.0));
+        spec.out_curves.volume = Some(flat_one);
+        spec.in_curves.volume = Some(AutomationCurves {
+            curves: vec![AutomationCurve::linear(
+                vec![CurvePoint { x: 0.0, y: 0.0 }, CurvePoint { x: 1.0, y: 0.0 }],
+                0.0,
+                1.0,
+            )],
+            minimum: 0.0,
+            maximum: 1.0,
+        });
+
+        let proc = TransitionProcessor::new(spec.clone());
+        assert_eq!(proc.stretch_mode, TimeStretchMode::Off);
+        let out = run_offline(spec, &a, &b);
+        let peak = out.iter().fold(0.0_f64, |acc, &s| acc.max(s.abs()));
+        assert!(
+            (peak - 0.5).abs() < 1e-6,
+            "identity-BPM passthrough inflated peak: {peak}"
         );
     }
 }
