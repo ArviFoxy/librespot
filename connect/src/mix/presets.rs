@@ -1096,4 +1096,147 @@ mod tests {
         assert!(inc.eq_low.is_some());
         assert!(out.filter_cutoff.is_some());
     }
+
+    #[test]
+    fn exhaustive_preset_and_override_matrix_holds_dsp_invariants() {
+        use crate::protocol::transition::{EqStyle, FilterFxStyle};
+
+        let check_deck = |label: &str, deck: &DeckCurves, is_incoming: bool| {
+            let vol = deck.volume.as_ref().expect("deck must have volume curve");
+            let v0 = eval_curves(vol, 0.0).unwrap();
+            let v1 = eval_curves(vol, 1.0).unwrap();
+            if is_incoming {
+                assert!(v0.abs() < 1e-6, "{label}: in vol(0)={v0}");
+                assert!((v1 - 1.0).abs() < 1e-6, "{label}: in vol(1)={v1}");
+            } else {
+                assert!((v0 - 1.0).abs() < 1e-6, "{label}: out vol(0)={v0}");
+                assert!(v1.abs() < 1e-6, "{label}: out vol(1)={v1}");
+            }
+
+            for i in 0..=20 {
+                let u = i as f64 / 20.0;
+                let v = eval_curves(vol, u).unwrap();
+                assert!(
+                    v.is_finite() && (0.0..=1.5).contains(&v),
+                    "{label}: vol({u})={v}"
+                );
+
+                for band in [&deck.eq_low, &deck.eq_mid, &deck.eq_high]
+                    .into_iter()
+                    .flatten()
+                {
+                    let raw = eval_curves(band, u).unwrap();
+                    assert!(raw.is_finite(), "{label}: non-finite eq raw at {u}");
+                    let gain = if let Some(ref sem) = deck.eq_semantics {
+                        let ev = apply_semantics(raw, sem);
+                        match ev.role {
+                            Some(SpecialRole::Kill | SpecialRole::Mute) => 0.0,
+                            Some(SpecialRole::Bypass | SpecialRole::Off) => 1.0,
+                            None => ev.as_linear_gain().unwrap_or(1.0),
+                        }
+                    } else {
+                        raw
+                    };
+                    assert!(
+                        gain.is_finite() && (0.0..=4.0).contains(&gain),
+                        "{label}: eq gain({u})={gain}"
+                    );
+                }
+
+                if let Some(ref fc) = deck.filter_cutoff {
+                    let raw = eval_curves(fc, u).unwrap();
+                    assert!(raw.is_finite(), "{label}: non-finite cutoff at {u}");
+                    if let Some(ref sem) = deck.filter_cutoff_semantics {
+                        let ev = apply_semantics(raw, sem);
+                        if ev.role.is_none() {
+                            let hz = ev.numeric.unwrap();
+                            assert!(
+                                hz.is_finite() && (10.0..=22_050.0).contains(&hz),
+                                "{label}: cutoff hz({u})={hz}"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        // 1. Every Preset ID 0..=20 for both beatmatched=false and beatmatched=true.
+        for id in 0..=20 {
+            for is_bm in [false, true] {
+                let preset = Preset {
+                    id,
+                    ..Default::default()
+                };
+                let (out, inc, handoff) = curves_from_proto_preset_with_hint(&preset, is_bm);
+                assert!((0.1..=0.9).contains(&handoff));
+                check_deck(&format!("preset {id} bm={is_bm} out"), &out, false);
+                check_deck(&format!("preset {id} bm={is_bm} in"), &inc, true);
+            }
+        }
+
+        // 2. Every style override ID 0..=10 across volume, EQ, and filter FX.
+        for style_id in 0..=10 {
+            let preset = Preset {
+                id: 4,
+                volume_style_override: MessageField::some(VolumeStyle {
+                    id: style_id,
+                    ..Default::default()
+                }),
+                eq_style_override: MessageField::some(EqStyle {
+                    id: style_id,
+                    ..Default::default()
+                }),
+                filter_fx_style_override: MessageField::some(FilterFxStyle {
+                    id: style_id,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let (out, inc, _) = curves_from_proto_preset_with_hint(&preset, true);
+            check_deck(&format!("style {style_id} out"), &out, false);
+            check_deck(&format!("style {style_id} in"), &inc, true);
+        }
+
+        // 3. Partial dB EQ override on a linear BassSwap base clears incompatible linear bands
+        //    so linear 0.0 (kill) is never misread as 0 dB (unity).
+        let preset_partial_db = Preset {
+            id: 4, // BassSwap base (linear eq_low)
+            eq_out_curve_overrides: MessageField::some(EqCurveOverrides {
+                mid: MessageField::some(ProtoCurves {
+                    curves: vec![ProtoCurve {
+                        points: vec![
+                            ProtoPoint {
+                                x: 0.0,
+                                y: 0.0,
+                                ..Default::default()
+                            },
+                            ProtoPoint {
+                                x: 1.0,
+                                y: -12.0,
+                                ..Default::default()
+                            },
+                        ],
+                        start: 0.0,
+                        end: 1.0,
+                        ..Default::default()
+                    }],
+                    minimum: -24.0,
+                    maximum: 0.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (out_db, _, _) = curves_from_proto_preset_with_hint(&preset_partial_db, true);
+        assert_eq!(
+            out_db.eq_semantics.as_ref().unwrap().output_unit,
+            ValueUnit::Decibels
+        );
+        assert!(out_db.eq_mid.is_some());
+        assert!(
+            out_db.eq_low.is_none(),
+            "linear base eq_low must be cleared when switching to Decibels override"
+        );
+    }
 }

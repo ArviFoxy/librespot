@@ -575,4 +575,42 @@ mod tests {
         assert_eq!(state.next_tracks().len(), 1);
         assert_eq!(state.next_tracks()[0].uri, uri_c);
     }
+
+    #[test]
+    fn transition_pair_snapshot_skips_delimiter_and_unavailable_tracks() {
+        let uri_a = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
+        let uri_b = "spotify:track:0VjIjW4GlUZAMYd2vXMi3b";
+        let uri_c = "spotify:track:11dFghVXANMlKmJXsNCbNl";
+
+        let mut delim = ProvidedTrack {
+            uri: "spotify:delimiter".to_string(),
+            uid: format!("{IDENTIFIER_DELIMITER}1"),
+            ..Default::default()
+        };
+        delim.set_provider(Provider::Context);
+
+        let mut unavail = make_track(uri_b, "u2", 1);
+        unavail.set_provider(Provider::Unavailable);
+
+        let track_a = make_track(uri_a, "u1", 0);
+        let track_c = make_track(uri_c, "u3", 2);
+
+        let mut state = ConnectState::default();
+        state.request.device = MessageField::some(Device {
+            player_state: MessageField::some(PlayerState::new()),
+            ..Default::default()
+        });
+        state.set_track(track_a);
+        state.next_tracks_mut().extend([delim, unavail, track_c]);
+
+        let (cur, next, _) = state
+            .transition_pair_snapshot()
+            .expect("must skip delimiter and unavailable entry to find track C");
+        assert_eq!(cur.uri, uri_a);
+        assert_eq!(next.uri, uri_c);
+        assert_eq!(
+            state.preview_next_track(),
+            Some(SpotifyUri::from_uri(uri_c).unwrap())
+        );
+    }
 }

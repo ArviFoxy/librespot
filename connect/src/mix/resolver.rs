@@ -2277,4 +2277,92 @@ mod tests {
             ContextMixSignal::Unspecified
         );
     }
+
+    #[test]
+    fn mismatched_meta_a_recipe_does_not_shadow_valid_meta_b_recipe_and_fade_respects_non_bm() {
+        let cfg = MixConfig::default();
+        let meta_a = TrackMixMetadata {
+            duration_ms: 200_000,
+            bpm: Some(140.0),
+            beatmatchability: Some(0.95),
+            ..Default::default()
+        };
+        let meta_b = TrackMixMetadata {
+            duration_ms: 210_000,
+            bpm: Some(145.0),
+            beatmatchability: Some(0.95),
+            ..Default::default()
+        };
+
+        // 1. Track A carries a stale recipe for (prev -> A) while Track B carries valid (A -> B).
+        let stale_tr = Transition {
+            overlap: MessageField::some(Overlap {
+                track_a_uri: "spotify:track:prev".to_string(),
+                track_b_uri: "spotify:track:aaa".to_string(),
+                start_a_ms: 100_000,
+                start_b_ms: 0,
+                duration_ms: 8_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let valid_tr = Transition {
+            overlap: MessageField::some(Overlap {
+                track_a_uri: "spotify:track:aaa".to_string(),
+                track_b_uri: "spotify:track:bbb".to_string(),
+                start_a_ms: 170_000,
+                start_b_ms: 4_000,
+                duration_ms: 10_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut map_a = HashMap::new();
+        map_a.insert(
+            "transition_recipe".to_string(),
+            BASE64.encode(&stale_tr.write_to_bytes().unwrap()),
+        );
+        let mut map_b = HashMap::new();
+        map_b.insert(
+            "transition_recipe".to_string(),
+            BASE64.encode(&valid_tr.write_to_bytes().unwrap()),
+        );
+        let candidates = collect_track_metadata_recipes(&map_a, &map_b);
+        assert_eq!(candidates.len(), 2);
+        let ctx_a = TrackTransitionContext {
+            track_uri: "spotify:track:aaa",
+            row_uid: "r1",
+            meta: &meta_a,
+        };
+        let ctx_b = TrackTransitionContext {
+            track_uri: "spotify:track:bbb",
+            row_uid: "r2",
+            meta: &meta_b,
+        };
+        let matched = candidates
+            .iter()
+            .find_map(|p| transition_proto_to_spec(p, ctx_a, ctx_b, &cfg))
+            .expect("valid recipe on meta_b must be matched after stale meta_a fails");
+        assert_eq!(matched.start_a_frame, ms_to_frames(170_000));
+        assert_eq!(matched.start_b_frame, ms_to_frames(4_000));
+
+        // 2. Priority 2 transferred fade with different BPMs (140 vs 145) and EQUAL fade durations
+        //    (5000 ms == 5000 ms) is a non-beatmatched fade/cut and must NOT force beatmatching.
+        let mut fade_a = HashMap::new();
+        fade_a.insert(
+            "audio.fade_out_start_time".to_string(),
+            "180000".to_string(),
+        );
+        fade_a.insert("audio.fade_out_duration".to_string(), "5000".to_string());
+        let mut fade_b = HashMap::new();
+        fade_b.insert("audio.fade_in_start_time".to_string(), "0".to_string());
+        fade_b.insert("audio.fade_in_duration".to_string(), "5000".to_string());
+        fade_b.insert("audio.fade_overlap".to_string(), "5000".to_string());
+        let fade_spec = transition_from_fade_metadata(ctx_a, &fade_a, ctx_b, &fade_b, &cfg)
+            .expect("valid non-beatmatched transferred fade must resolve");
+        assert!(
+            fade_spec.tempo.is_none(),
+            "equal-duration fade between different BPMs must not force beatmatching"
+        );
+    }
 }
