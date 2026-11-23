@@ -9,7 +9,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt::{Display, Formatter};
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Request {
@@ -149,6 +152,8 @@ pub struct SetOptionsCommand {
     pub shuffling_context: Option<bool>,
     pub repeating_context: Option<bool>,
     pub repeating_track: Option<bool>,
+    #[serde(default)]
+    pub modes: Option<HashMap<String, String>>,
     pub options: Option<OptionsOptions>,
     pub logging_params: LoggingParams,
 }
@@ -182,6 +187,8 @@ pub struct PlayOptions {
     pub skip_to: Option<SkipTo>,
     #[serde(default, deserialize_with = "option_json_proto")]
     pub player_options_override: Option<ContextPlayerOptionOverrides>,
+    #[serde(default)]
+    pub configuration_override: Option<HashMap<String, String>>,
     pub license: Option<String>,
     // possible to send wie web-api
     pub seek_to: Option<u32>,
@@ -214,4 +221,52 @@ pub struct LoggingParams {
     pub command_initiated_time: Option<i64>,
     pub page_instance_ids: Option<Vec<String>>,
     pub command_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_options_preserves_modes() {
+        let json = r#"{
+            "endpoint": "set_options",
+            "shuffling_context": false,
+            "modes": {"mix": "auto", "smart_shuffle": "off"},
+            "logging_params": {}
+        }"#;
+        let cmd: Command = serde_json::from_str(json).expect("deserialize SetOptionsCommand");
+        let Command::SetOptions(opts) = cmd else {
+            panic!("expected SetOptions");
+        };
+        let modes = opts.modes.expect("modes should be preserved");
+        assert_eq!(modes.get("mix").map(String::as_str), Some("auto"));
+        assert_eq!(modes.get("smart_shuffle").map(String::as_str), Some("off"));
+    }
+
+    #[test]
+    fn play_options_preserves_configuration_override_and_modes() {
+        let json = r#"{
+            "player_options_override": {
+                "shuffling_context": false,
+                "modes": {"automix": "on"}
+            },
+            "configuration_override": {"audio.fade_overlap": "true"}
+        }"#;
+        let opts: PlayOptions = serde_json::from_str(json).expect("deserialize PlayOptions");
+        assert_eq!(
+            opts.player_options_override
+                .as_ref()
+                .and_then(|o| o.modes.get("automix"))
+                .map(String::as_str),
+            Some("on")
+        );
+        assert_eq!(
+            opts.configuration_override
+                .as_ref()
+                .and_then(|c| c.get("audio.fade_overlap"))
+                .map(String::as_str),
+            Some("true")
+        );
+    }
 }

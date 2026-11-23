@@ -34,6 +34,12 @@ enum AutomixStyle {
     CUSTOM = 7;
     HEURISTIC = 8;
     BACKEND = 9;
+    PRO = 10;
+    CUT = 11;
+    CROSSFADE = 12;
+    EXPLICIT_NONE = 13;
+    RADIO = 14;
+    AUTO = 15;
 }
 
 enum TransitionType {

@@ -128,6 +128,14 @@ message Capabilities {
     bool supports_rooms = 28;
     bool supports_dj = 29;
     common.media.AudioQuality supported_audio_quality = 30;
+    bool supports_smart_shuffle_mode = 33;
+    bool supports_remote_sleep_timer = 34;
+    bool supports_ping_request = 35;
+    bool supports_playlist_mixing = 36;
+    bool supports_remote_audio_quality_control = 37;
+    bool supports_zephyr = 38;
+    bool supports_gapless = 39;
+    bool supports_crossfade = 40;
 }
 
 message CapabilitySupportDetails {

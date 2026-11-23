@@ -55,6 +55,18 @@ fn compile() {
         proto_dir.join("play_origin.proto"),
         proto_dir.join("suppressions.proto"),
         proto_dir.join("instrumentation_params.proto"),
+        // Playlist mixing / automix / transitions
+        proto_dir.join("automix_mode.proto"),
+        proto_dir.join("cuepoints.proto"),
+        proto_dir.join("transition.proto"),
+        proto_dir.join("automation_value_semantics.proto"),
+        proto_dir.join("mixing_bundle.proto"),
+        proto_dir.join("mix_state.proto"),
+        proto_dir.join("mix_beats.proto"),
+        proto_dir.join("mixability.proto"),
+        proto_dir.join("mix_vocal_activity.proto"),
+        proto_dir.join("audio_attributes_v2.proto"),
+        proto_dir.join("transition_metadata_extension.proto"),
         // TODO: remove these legacy protobufs when we are on the new API completely
         proto_dir.join("authentication.proto"),
         proto_dir.join("canvaz.proto"),

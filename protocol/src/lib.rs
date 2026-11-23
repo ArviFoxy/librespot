@@ -3,4 +3,6 @@
 
 mod impl_trait;
 
+pub use protobuf;
+
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));

@@ -9,6 +9,7 @@ use crate::{
 };
 use protobuf::MessageField;
 use rand::Rng;
+use std::collections::HashMap;
 
 #[derive(Default, Debug)]
 pub(crate) struct ShuffleState {
@@ -48,6 +49,26 @@ impl ConnectState {
         self.set_shuffle(false);
         self.set_repeat_track(false);
         self.set_repeat_context(false);
+        self.clear_modes();
+    }
+
+    pub fn set_modes(&mut self, modes: HashMap<String, String>) {
+        self.add_options_if_empty();
+        if let Some(options) = self.player_mut().options.as_mut() {
+            for (key, value) in modes {
+                if value.is_empty() {
+                    options.modes.remove(&key);
+                } else {
+                    options.modes.insert(key, value);
+                }
+            }
+        }
+    }
+
+    pub fn clear_modes(&mut self) {
+        if let Some(options) = self.player_mut().options.as_mut() {
+            options.modes.clear();
+        }
     }
 
     fn validate_shuffle_allowed(&self) -> Result<(), Error> {
@@ -107,7 +128,48 @@ impl ConnectState {
         self.player().options.repeating_context
     }
 
+    #[allow(dead_code)]
+    pub fn modes(&self) -> Option<&HashMap<String, String>> {
+        self.player().options.as_ref().map(|o| &o.modes)
+    }
+
     pub fn repeat_track(&self) -> bool {
         self.player().options.repeating_track
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{connect::Device, player::PlayerState};
+
+    #[test]
+    fn set_modes_merges_and_clears_empty_values() {
+        let mut state = ConnectState::default();
+        state.request.device = MessageField::some(Device {
+            player_state: MessageField::some(PlayerState::new()),
+            ..Default::default()
+        });
+        state.set_modes(HashMap::from([
+            ("mix".to_string(), "on".to_string()),
+            ("smart_shuffle".to_string(), "1".to_string()),
+        ]));
+        assert_eq!(
+            state.modes().and_then(|m| m.get("mix")).map(String::as_str),
+            Some("on")
+        );
+
+        state.set_modes(HashMap::from([("mix".to_string(), String::new())]));
+        assert_eq!(state.modes().and_then(|m| m.get("mix")), None);
+        assert_eq!(
+            state
+                .modes()
+                .and_then(|m| m.get("smart_shuffle"))
+                .map(String::as_str),
+            Some("1")
+        );
+
+        state.reset_options();
+        assert!(state.modes().is_none_or(HashMap::is_empty));
     }
 }

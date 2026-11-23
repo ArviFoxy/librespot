@@ -762,7 +762,7 @@ impl SpircTask {
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            SpircCommand::Load(command) => self.handle_load(command, None, None, None).await?,
             SpircCommand::AddToQueue(uri) => self.handle_add_to_queue(uri).await,
             SpircCommand::ClearQueue => {
                 self.connect_state.clear_queue()?;
@@ -1110,6 +1110,13 @@ impl SpircTask {
                     None => Err(SpircError::NoUri("context"))?,
                 };
 
+                let modes = play
+                    .options
+                    .player_options_override
+                    .as_mut()
+                    .map(|overrides| std::mem::take(&mut overrides.modes))
+                    .filter(|m| !m.is_empty());
+
                 let context_options = play
                     .options
                     .player_options_override
@@ -1135,6 +1142,7 @@ impl SpircTask {
                     },
                     play.context.pages.pop(),
                     fallback_index,
+                    modes,
                 )
                 .await?;
 
@@ -1171,6 +1179,11 @@ impl SpircTask {
                 let shuffle = set_options.shuffling_context;
                 if let Some(shuffle) = shuffle {
                     self.handle_shuffle(shuffle)?;
+                }
+
+                if let Some(modes) = set_options.modes {
+                    debug!("set_options modes: {modes:?}");
+                    self.connect_state.set_modes(modes);
                 }
             }
             SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
@@ -1367,6 +1380,7 @@ impl SpircTask {
         cmd: LoadRequest,
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
+        modes: Option<std::collections::HashMap<String, String>>,
     ) -> Result<(), Error> {
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
@@ -1433,6 +1447,11 @@ impl SpircTask {
             self.connect_state.set_shuffle(options.shuffle);
             self.connect_state.set_repeat_context(options.repeat);
             self.connect_state.set_repeat_track(options.repeat_track);
+        }
+
+        if let Some(modes) = modes {
+            debug!("loading with modes: {modes:?}");
+            self.connect_state.set_modes(modes);
         }
 
         if matches!(cmd_options.context_options, Some(LoadContextOptions::Options(ref o)) if o.shuffle)

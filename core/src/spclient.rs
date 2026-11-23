@@ -51,6 +51,15 @@ component! {
 
 pub type SpClientResult = Result<Bytes, Error>;
 
+#[derive(Debug, Clone)]
+pub struct ExtendedMetadataEntry {
+    pub kind: ExtensionKind,
+    pub entity_uri: String,
+    pub status_code: i32,
+    pub type_url: String,
+    pub data: Bytes,
+}
+
 #[allow(clippy::declare_interior_mutable_const)]
 pub const CLIENT_TOKEN: HeaderName = HeaderName::from_static("client-token");
 #[allow(clippy::declare_interior_mutable_const)]
@@ -590,6 +599,58 @@ impl SpClient {
             )
             .await?;
         Ok(BatchedExtensionResponse::parse_from_bytes(&res)?)
+    }
+
+    pub async fn get_extended_metadata_entries(
+        &self,
+        entity_requests: Vec<(String, Vec<ExtensionKind>)>,
+    ) -> Result<Vec<ExtendedMetadataEntry>, Error> {
+        let req = BatchedEntityRequest {
+            entity_request: entity_requests
+                .into_iter()
+                .map(|(entity_uri, kinds)| EntityRequest {
+                    entity_uri,
+                    query: kinds
+                        .into_iter()
+                        .map(|kind| ExtensionQuery {
+                            extension_kind: EnumOrUnknown::new(kind),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let res = self.get_extended_metadata(req).await?;
+        let mut entries = Vec::new();
+
+        for array in res.extended_metadata {
+            let Ok(kind) = array.extension_kind.enum_value() else {
+                continue;
+            };
+            for mut item in array.extension_data {
+                let status_code = item
+                    .header
+                    .as_ref()
+                    .map(|h| h.status_code)
+                    .unwrap_or_default();
+                let (type_url, data) = match item.extension_data.take() {
+                    Some(any) => (any.type_url, Bytes::from(any.value)),
+                    None => (String::new(), Bytes::new()),
+                };
+                entries.push(ExtendedMetadataEntry {
+                    kind,
+                    entity_uri: item.entity_uri,
+                    status_code,
+                    type_url,
+                    data,
+                });
+            }
+        }
+
+        Ok(entries)
     }
 
     pub async fn get_metadata(&self, kind: ExtensionKind, id: &SpotifyUri) -> SpClientResult {
