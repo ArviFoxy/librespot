@@ -38,6 +38,9 @@ struct DeckChain {
     /// Tracks whether EQ/filter need processing (bypassed when curves are neutral/absent).
     has_eq: bool,
     has_filter: bool,
+    /// Per-sample 2 ms volume smoother preventing clicks on discontinuous user volume steps.
+    smoothed_vol: f64,
+    vol_smooth_coeff: f64,
 }
 
 impl DeckChain {
@@ -51,7 +54,8 @@ impl DeckChain {
     ) -> Self {
         let has_eq = curves.eq_low.is_some() || curves.eq_mid.is_some() || curves.eq_high.is_some();
         let has_filter = curves.filter_cutoff.is_some();
-        Self {
+        let vol_smooth_coeff = (-1.0 / (0.002 * f64::from(SAMPLE_RATE))).exp();
+        let mut chain = Self {
             stretcher: DeckStretcher::new(stretch_mode, origin_frame, initial_ratio),
             eq: DeckEq::new(eq_topology),
             filter: DeckFilter::new(),
@@ -62,7 +66,19 @@ impl DeckChain {
             last_ratio: initial_ratio,
             has_eq,
             has_filter,
-        }
+            smoothed_vol: if is_incoming { 0.0 } else { 1.0 },
+            vol_smooth_coeff,
+        };
+        chain.smoothed_vol = chain.evaluate_volume(0.0);
+        chain
+    }
+
+    #[inline]
+    fn smoothed_volume(&mut self, u: f64) -> f64 {
+        let target = self.evaluate_volume(u);
+        self.smoothed_vol =
+            self.vol_smooth_coeff * self.smoothed_vol + (1.0 - self.vol_smooth_coeff) * target;
+        self.smoothed_vol
     }
 
     #[inline]
@@ -458,10 +474,12 @@ impl TransitionProcessor {
                         total: BOUNDARY_BLEND_FRAMES,
                     });
                 } else {
+                    // No wet-to-dry blend required: mark completed at `pos = 0` so
+                    // `drain_deck_b_continuation()` resumes at exact `anchor_frame` with zero skip.
                     self.exit_blend = Some(ExitBlend {
                         anchor_frame,
-                        pos: BOUNDARY_BLEND_FRAMES,
-                        total: BOUNDARY_BLEND_FRAMES,
+                        pos: 0,
+                        total: 0,
                     });
                     break;
                 }
@@ -470,6 +488,31 @@ impl TransitionProcessor {
             // Wet-to-dry exit blend phase: Deck A is silent, Deck B blends from wet to exact dry PCM.
             if let Some(mut exit) = self.exit_blend {
                 if exit.pos >= exit.total {
+                    // If an abort fade was requested right before exit, keep draining dry Deck B
+                    // frames through the abort cosine fade until silence is reached.
+                    if let Some(mut rem) = self.abort_fade_remaining {
+                        if rem == 0 {
+                            break;
+                        }
+                        let want = chunk.min(rem);
+                        for _ in 0..want {
+                            let frame_idx = exit.anchor_frame + exit.pos as u64;
+                            let dry = self.read_raw_b_frame(frame_idx).unwrap_or([0.0, 0.0]);
+                            let g = (rem as f64 / ABORT_FADE_FRAMES as f64 * FRAC_PI_2).sin();
+                            let l = dry[0] * g;
+                            let r = dry[1] * g;
+                            out.push(if l.is_finite() { l } else { 0.0 });
+                            out.push(if r.is_finite() { r } else { 0.0 });
+                            rem -= 1;
+                            exit.pos += 1;
+                            exit.total = exit.pos;
+                            total_written += 1;
+                            self.frames_rendered += 1;
+                        }
+                        self.abort_fade_remaining = Some(rem);
+                        self.exit_blend = Some(exit);
+                        continue;
+                    }
                     break;
                 }
                 let want = chunk.min(exit.total - exit.pos);
@@ -477,13 +520,28 @@ impl TransitionProcessor {
                 let avail_b = self.deck_b.out_frames();
                 if avail_b == 0 {
                     if self.deck_b.is_drained() {
-                        exit.pos = exit.total;
+                        exit.total = exit.pos;
                         self.exit_blend = Some(exit);
                     }
                     break;
                 }
+                let equal_power_exit = self.stretch_mode == TimeStretchMode::PitchPreserving
+                    || (self.deck_b.has_eq
+                        && matches!(
+                            self.spec.eq_topology,
+                            super::spec::EqTopology::LinkwitzRileyIsolator { .. }
+                        ));
                 let n = want.min(avail_b);
                 for _ in 0..n {
+                    let frame_idx = exit.anchor_frame + exit.pos as u64;
+                    let Some(dry) = self.read_raw_b_frame(frame_idx) else {
+                        if self.deck_b.is_drained() {
+                            exit.total = exit.pos;
+                        }
+                        self.exit_blend = Some(exit);
+                        break;
+                    };
+
                     let mut wet_b = self.deck_b.pop_frame();
                     if self.deck_b.has_eq {
                         let eq_gains = self.deck_b.evaluate_eq_gains(1.0);
@@ -493,24 +551,21 @@ impl TransitionProcessor {
                         let (mode, hz, q) = self.deck_b.evaluate_filter(1.0);
                         wet_b = self.deck_b.filter.process(wet_b, mode, hz, q);
                     }
-                    let vol_b = self.deck_b.evaluate_volume(1.0);
+                    let vol_b = self.deck_b.smoothed_volume(1.0);
                     wet_b[0] *= vol_b;
                     wet_b[1] *= vol_b;
 
-                    let frame_idx = exit.anchor_frame + exit.pos as u64;
-                    let mut mixed = if let Some(dry) = self.read_raw_b_frame(frame_idx) {
-                        let alpha = ((exit.pos + 1) as f64 / exit.total as f64 * FRAC_PI_2)
-                            .sin()
-                            .powi(2);
-                        [
-                            wet_b[0] * (1.0 - alpha) + dry[0] * alpha,
-                            wet_b[1] * (1.0 - alpha) + dry[1] * alpha,
-                        ]
+                    let theta = (exit.pos + 1) as f64 / exit.total as f64 * FRAC_PI_2;
+                    let (w_wet, w_dry) = if equal_power_exit {
+                        (theta.cos(), theta.sin())
                     } else {
-                        exit.pos = exit.total;
-                        self.exit_blend = Some(exit);
-                        break;
+                        let alpha = theta.sin().powi(2);
+                        (1.0 - alpha, alpha)
                     };
+                    let mut mixed = [
+                        wet_b[0] * w_wet + dry[0] * w_dry,
+                        wet_b[1] * w_wet + dry[1] * w_dry,
+                    ];
 
                     if let Some(ref mut rem) = self.abort_fade_remaining {
                         if *rem == 0 {
@@ -572,12 +627,15 @@ impl TransitionProcessor {
             self.clock.advance_frames(n);
             let u_end = self.clock.progress();
 
+            let equal_power_entry = self.stretch_mode == TimeStretchMode::PitchPreserving
+                || (self.deck_a.has_eq
+                    && matches!(
+                        self.spec.eq_topology,
+                        super::spec::EqTopology::LinkwitzRileyIsolator { .. }
+                    ));
+
             for i in 0..n {
-                let frac = if n > 1 {
-                    i as f64 / (n - 1) as f64
-                } else {
-                    0.0
-                };
+                let frac = i as f64 / n as f64;
                 let u = u_start + frac * (u_end - u_start);
 
                 let mut a = if i < avail_a {
@@ -586,7 +644,7 @@ impl TransitionProcessor {
                     [0.0, 0.0]
                 };
 
-                // Click-free cosine blend from dry Deck A into stretched/filtered Deck A over the first ~20 ms.
+                // Click-free blend from dry Deck A into stretched/filtered Deck A over the first ~20 ms.
                 let mut wet_a = a;
                 if self.deck_a.has_eq {
                     let eq_gains = self.deck_a.evaluate_eq_gains(u);
@@ -603,20 +661,24 @@ impl TransitionProcessor {
                         self.entry_dry_a[self.entry_blend_pos * CHANNELS],
                         self.entry_dry_a[self.entry_blend_pos * CHANNELS + 1],
                     ];
-                    let alpha = (self.entry_blend_pos as f64 / BOUNDARY_BLEND_FRAMES as f64
-                        * FRAC_PI_2)
-                        .sin()
-                        .powi(2);
+                    let theta =
+                        self.entry_blend_pos as f64 / BOUNDARY_BLEND_FRAMES as f64 * FRAC_PI_2;
+                    let (w_dry, w_wet) = if equal_power_entry {
+                        (theta.cos(), theta.sin())
+                    } else {
+                        let alpha = theta.sin().powi(2);
+                        (1.0 - alpha, alpha)
+                    };
                     a = [
-                        dry[0] * (1.0 - alpha) + wet_a[0] * alpha,
-                        dry[1] * (1.0 - alpha) + wet_a[1] * alpha,
+                        dry[0] * w_dry + wet_a[0] * w_wet,
+                        dry[1] * w_dry + wet_a[1] * w_wet,
                     ];
                     self.entry_blend_pos += 1;
                 } else {
                     a = wet_a;
                 }
 
-                let vol_a = self.deck_a.evaluate_volume(u);
+                let vol_a = self.deck_a.smoothed_volume(u);
                 a[0] *= vol_a;
                 a[1] *= vol_a;
 
@@ -633,7 +695,7 @@ impl TransitionProcessor {
                     let (mode, hz, q) = self.deck_b.evaluate_filter(u);
                     b = self.deck_b.filter.process(b, mode, hz, q);
                 }
-                let vol_b = self.deck_b.evaluate_volume(u);
+                let vol_b = self.deck_b.smoothed_volume(u);
                 b[0] *= vol_b;
                 b[1] *= vol_b;
 
@@ -650,7 +712,7 @@ impl TransitionProcessor {
                     *rem -= 1;
                 }
 
-                // Final NaN/Inf safety barrier before master limiter and PipeWire F32 sink.
+                // Final NaN/Inf safety barrier before master limiter and audio sink.
                 out.push(if sum_l.is_finite() { sum_l } else { 0.0 });
                 out.push(if sum_r.is_finite() { sum_r } else { 0.0 });
                 total_written += 1;
@@ -864,8 +926,7 @@ mod tests {
 
     #[test]
     fn pitch_preserving_stretcher_preserves_mid_side_stereo_coherence() {
-        // Protects Mid/Side room-correction DSP (such as server1's Run 14 M/S FIR):
-        // stretching a correlated mono-in-stereo signal (100% Mid, 0% Side) must keep
+        // Stretching a correlated mono-in-stereo signal (100% Mid, 0% Side) must keep
         // Side leakage minimal rather than decorrelating Left and Right phases.
         let fs = f64::from(SAMPLE_RATE);
         let n_frames = SAMPLE_RATE as usize * 3;

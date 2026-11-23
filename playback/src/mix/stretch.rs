@@ -39,6 +39,7 @@ enum StretcherImpl {
         input: VecDeque<f32>,
         eof: bool,
         eof_notified: bool,
+        faulted: bool,
         next_cmd_id: u64,
         last_scheduled_ratio: f64,
         scratch_in: Vec<f32>,
@@ -49,7 +50,11 @@ enum StretcherImpl {
 impl DeckStretcher {
     /// Construct a stretcher starting at `source_origin_frame` with initial speed `initial_ratio`.
     pub fn new(mode: TimeStretchMode, source_origin_frame: u64, initial_ratio: f64) -> Self {
-        let ratio = initial_ratio.clamp(0.5, 2.0);
+        let ratio = if initial_ratio.is_finite() {
+            initial_ratio.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
         let impl_state = match mode {
             TimeStretchMode::Off => StretcherImpl::Bypass {
                 input: VecDeque::with_capacity(8192 * CHANNELS),
@@ -83,6 +88,7 @@ impl DeckStretcher {
                         input: VecDeque::with_capacity(16_384 * CHANNELS),
                         eof: false,
                         eof_notified: false,
+                        faulted: false,
                         next_cmd_id: 1,
                         last_scheduled_ratio: ratio,
                         scratch_in: Vec::with_capacity(2048 * CHANNELS),
@@ -183,7 +189,11 @@ impl DeckStretcher {
 
     /// Update the instantaneous tempo ratio `source_speed / output_speed`.
     pub fn set_ratio(&mut self, ratio: f64) {
-        let ratio = ratio.clamp(0.5, 2.0);
+        let ratio = if ratio.is_finite() {
+            ratio.clamp(0.5, 2.0)
+        } else {
+            return;
+        };
         match &mut self.mode {
             StretcherImpl::Bypass { .. } => {}
             StretcherImpl::Varispeed { ratio: r, .. } => *r = ratio,
@@ -235,7 +245,12 @@ impl DeckStretcher {
                 let end = *buf_start_frame as f64 + (buf.len() / CHANNELS) as f64;
                 *eof && *read_pos_frames + 1.0 >= end
             }
-            StretcherImpl::PitchPreserving { session, eof, .. } => *eof && session.finished(),
+            StretcherImpl::PitchPreserving {
+                session,
+                eof,
+                faulted,
+                ..
+            } => *faulted || (*eof && session.finished()),
         }
     }
 
@@ -315,10 +330,14 @@ impl DeckStretcher {
                 input,
                 eof,
                 eof_notified,
+                faulted,
                 scratch_in,
                 scratch_out,
                 ..
             } => {
+                if *faulted {
+                    return 0;
+                }
                 // Feed pending source requests and pump until we have `max_frames` ready or need more input.
                 for _ in 0..64 {
                     while let Some(req) = session.source_request() {
@@ -360,9 +379,13 @@ impl DeckStretcher {
                                 break;
                             }
                         }
+                        ProcessStatus::Fault => {
+                            warn!("Pitch-preserving time-stretcher faulted; draining deck cleanly");
+                            *faulted = true;
+                            break;
+                        }
                         ProcessStatus::Finished
                         | ProcessStatus::Rendered
-                        | ProcessStatus::Fault
                         | ProcessStatus::Paused
                         | ProcessStatus::NeedOutput => break,
                         ProcessStatus::Progress
@@ -389,28 +412,6 @@ impl DeckStretcher {
                 self.current_source_frame = self.source_origin_frame + session.position();
                 self.output_frames_emitted += stamp.frames as u64;
                 stamp.frames
-            }
-        }
-    }
-
-    /// Remaining unconsumed raw input samples in exact source-frame order after the current
-    /// stretcher position (only exact when exiting a transition at unity ratio `1.0`).
-    pub fn drain_unused_input_frames(&mut self) -> Vec<f64> {
-        match &mut self.mode {
-            StretcherImpl::Bypass { input, .. } => input.drain(..).collect(),
-            StretcherImpl::Varispeed {
-                buf,
-                buf_start_frame,
-                read_pos_frames,
-                ..
-            } => {
-                let offset = ((*read_pos_frames).round() as u64).saturating_sub(*buf_start_frame);
-                let drop = (offset as usize * CHANNELS).min(buf.len());
-                buf.drain(..drop);
-                buf.drain(..).collect()
-            }
-            StretcherImpl::PitchPreserving { input, .. } => {
-                input.drain(..).map(f64::from).collect()
             }
         }
     }

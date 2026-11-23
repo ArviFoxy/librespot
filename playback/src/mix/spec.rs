@@ -246,9 +246,10 @@ pub enum EqTopology {
 
 impl Default for EqTopology {
     fn default() -> Self {
-        Self::LinkwitzRileyIsolator {
-            low_hz: 250.0,
-            high_hz: 2500.0,
+        Self::TptShelving {
+            low_hz: 200.0,
+            mid_hz: 1000.0,
+            high_hz: 4000.0,
         }
     }
 }

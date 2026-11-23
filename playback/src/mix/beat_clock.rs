@@ -39,9 +39,26 @@ pub struct BeatClock {
     pub beats_b: Option<BeatGrid>,
     start_a_beat_idx: f64,
     start_b_beat_idx: f64,
+    /// Octave factor mapping `beat_pos` (Track A's nominal octave) into each grid's native beat spacing (`0.5`, `1.0`, or `2.0`).
+    grid_scale_a: f64,
+    grid_scale_b: f64,
 }
 
 impl BeatClock {
+    fn compute_grid_scale(reference_bpm: f64, grid: &BeatGrid, start_idx: f64) -> f64 {
+        let Some(raw_bpm) = local_grid_bpm(grid, start_idx) else {
+            return 1.0;
+        };
+        let ratio = raw_bpm / reference_bpm;
+        if (ratio - 0.5).abs() < 0.15 {
+            0.5
+        } else if (ratio - 2.0).abs() < 0.35 {
+            2.0
+        } else {
+            1.0
+        }
+    }
+
     pub fn new(
         start_a_frame: u64,
         start_b_frame: u64,
@@ -67,6 +84,8 @@ impl BeatClock {
                 beats_b: None,
                 start_a_beat_idx: start_a_sec,
                 start_b_beat_idx: start_b_sec,
+                grid_scale_a: 1.0,
+                grid_scale_b: 1.0,
             };
         };
 
@@ -93,6 +112,16 @@ impl BeatClock {
             .as_ref()
             .and_then(|g| time_to_beat_index(g, start_b_sec))
             .unwrap_or(0.0);
+        let grid_scale_a = plan
+            .beats_a
+            .as_ref()
+            .map(|g| Self::compute_grid_scale(bpm_a, g, start_a_beat_idx))
+            .unwrap_or(1.0);
+        let grid_scale_b = plan
+            .beats_b
+            .as_ref()
+            .map(|g| Self::compute_grid_scale(bpm_a, g, start_b_beat_idx))
+            .unwrap_or(1.0);
 
         Self {
             bpm_a,
@@ -106,6 +135,8 @@ impl BeatClock {
             beats_b: plan.beats_b.clone(),
             start_a_beat_idx,
             start_b_beat_idx,
+            grid_scale_a,
+            grid_scale_b,
         }
     }
 
@@ -127,11 +158,13 @@ impl BeatClock {
         self.bpm_a + u * (self.bpm_b_effective - self.bpm_a)
     }
 
-    /// Instantaneous local tempo (BPM) of track A at current beat offset `beat_pos`.
+    /// Instantaneous local tempo (BPM) of track A at current beat offset `beat_pos`,
+    /// folded to Track A's nominal octave.
     pub fn local_bpm_a(&self) -> f64 {
         if let Some(ref grid) = self.beats_a {
-            if let Some(bpm) = local_grid_bpm(grid, self.start_a_beat_idx + self.beat_pos) {
-                return bpm;
+            let idx = self.start_a_beat_idx + self.beat_pos * self.grid_scale_a;
+            if let Some(bpm) = local_grid_bpm(grid, idx) {
+                return fold_bpm_octave(self.bpm_a, bpm);
             }
         }
         self.bpm_a
@@ -141,7 +174,8 @@ impl BeatClock {
     /// folded to match track A's octave.
     pub fn local_bpm_b(&self) -> f64 {
         if let Some(ref grid) = self.beats_b {
-            if let Some(bpm) = local_grid_bpm(grid, self.start_b_beat_idx + self.beat_pos) {
+            let idx = self.start_b_beat_idx + self.beat_pos * self.grid_scale_b;
+            if let Some(bpm) = local_grid_bpm(grid, idx) {
                 return fold_bpm_octave(self.bpm_a, bpm);
             }
         }
@@ -168,12 +202,16 @@ impl BeatClock {
         let t_a = self
             .beats_a
             .as_ref()
-            .and_then(|g| beat_index_to_time(g, self.start_a_beat_idx + self.beat_pos))
+            .and_then(|g| {
+                beat_index_to_time(g, self.start_a_beat_idx + self.beat_pos * self.grid_scale_a)
+            })
             .unwrap_or_else(|| self.start_a_sec + self.beat_pos * 60.0 / self.bpm_a);
         let t_b = self
             .beats_b
             .as_ref()
-            .and_then(|g| beat_index_to_time(g, self.start_b_beat_idx + self.beat_pos))
+            .and_then(|g| {
+                beat_index_to_time(g, self.start_b_beat_idx + self.beat_pos * self.grid_scale_b)
+            })
             .unwrap_or_else(|| self.start_b_sec + self.beat_pos * 60.0 / self.bpm_b_effective);
         (t_a * fs, t_b * fs)
     }
@@ -206,43 +244,23 @@ impl BeatClock {
             return true;
         }
 
-        let octave_scale = |grid: &BeatGrid, start_idx: f64| -> f64 {
-            let Some(raw_bpm) = local_grid_bpm(grid, start_idx) else {
-                return 1.0;
-            };
-            let ratio = raw_bpm / self.bpm_a;
-            if (ratio - 0.5).abs() < 0.1 {
-                0.5
-            } else if (ratio - 2.0).abs() < 0.25 {
-                2.0
-            } else {
-                1.0
-            }
-        };
-        let scale_a = self
-            .beats_a
-            .as_ref()
-            .map(|g| octave_scale(g, self.start_a_beat_idx))
-            .unwrap_or(1.0);
-        let scale_b = self
-            .beats_b
-            .as_ref()
-            .map(|g| octave_scale(g, self.start_b_beat_idx))
-            .unwrap_or(1.0);
-
         for step in 1..=4 {
             let beat_offset = (step as f64 / 4.0) * self.total_beats;
             let expected_dt = beat_offset * 60.0 / self.bpm_a;
             let dt_a = self
                 .beats_a
                 .as_ref()
-                .and_then(|g| beat_index_to_time(g, self.start_a_beat_idx + beat_offset * scale_a))
+                .and_then(|g| {
+                    beat_index_to_time(g, self.start_a_beat_idx + beat_offset * self.grid_scale_a)
+                })
                 .map(|t| t - self.start_a_sec)
                 .unwrap_or(expected_dt);
             let dt_b = self
                 .beats_b
                 .as_ref()
-                .and_then(|g| beat_index_to_time(g, self.start_b_beat_idx + beat_offset * scale_b))
+                .and_then(|g| {
+                    beat_index_to_time(g, self.start_b_beat_idx + beat_offset * self.grid_scale_b)
+                })
                 .map(|t| t - self.start_b_sec)
                 .unwrap_or(beat_offset * 60.0 / self.bpm_b_effective);
 

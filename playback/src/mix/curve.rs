@@ -37,11 +37,15 @@ impl EvaluatedValue {
 ///
 /// Returns `None` if `u` lies outside `[curve.start, curve.end]` or the curve has no points.
 pub fn eval_curve(curve: &AutomationCurve, u: f64) -> Option<f64> {
-    if curve.points.is_empty() {
+    if !u.is_finite() || curve.points.is_empty() {
         return None;
     }
     let span = curve.end - curve.start;
-    if span > 0.0 && (u < curve.start || u > curve.end) {
+    if span > 0.0 {
+        if u < curve.start || u > curve.end {
+            return None;
+        }
+    } else if (u - curve.start).abs() > 1e-9 {
         return None;
     }
 
@@ -157,6 +161,9 @@ fn eval_cubic_bezier_chain(points: &[CurvePoint], x: f64) -> f64 {
 
 /// Evaluate an [`AutomationCurves`] collection at normalized transition progress `u in [0.0, 1.0]`.
 pub fn eval_curves(curves: &AutomationCurves, u: f64) -> Option<f64> {
+    if !u.is_finite() {
+        return None;
+    }
     let u = u.clamp(0.0, 1.0);
     let mut matched = None;
     for c in &curves.curves {

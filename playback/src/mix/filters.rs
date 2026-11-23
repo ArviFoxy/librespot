@@ -47,8 +47,16 @@ impl TptSvf2 {
     #[inline]
     pub fn set_params(&mut self, cutoff_hz: f64, q: f64) {
         let fs = f64::from(SAMPLE_RATE);
-        let fc = cutoff_hz.clamp(15.0, 0.45 * fs);
-        let q = q.clamp(0.5, 12.0);
+        let fc = if cutoff_hz.is_finite() {
+            cutoff_hz.clamp(15.0, 0.45 * fs)
+        } else {
+            1000.0
+        };
+        let q = if q.is_finite() {
+            q.clamp(0.5, 12.0)
+        } else {
+            std::f64::consts::FRAC_1_SQRT_2
+        };
         self.g = (PI * fc / fs).tan();
         self.k = 1.0 / q;
         self.a1 = 1.0 / (1.0 + self.g * (self.g + self.k));
@@ -58,6 +66,7 @@ impl TptSvf2 {
 
     #[inline]
     fn tick_raw(&mut self, ch: usize, v0: f64) -> (f64, f64, f64) {
+        let v0 = if v0.is_finite() { v0 } else { 0.0 };
         let v3 = v0 - self.ic2[ch];
         let v1 = self.a1 * self.ic1[ch] + self.a2 * v3;
         let v2 = self.ic2[ch] + self.a2 * self.ic1[ch] + self.a3 * v3;
@@ -146,8 +155,16 @@ impl LinkwitzRiley3Band {
 
     #[inline]
     pub fn process(&mut self, frame: [f64; 2], target_gains: [f64; 3]) -> [f64; 2] {
+        let frame = [
+            if frame[0].is_finite() { frame[0] } else { 0.0 },
+            if frame[1].is_finite() { frame[1] } else { 0.0 },
+        ];
         for (g, &target) in self.gains.iter_mut().zip(target_gains.iter()) {
-            let clamped = target.clamp(0.0, 4.0);
+            let clamped = if target.is_finite() {
+                target.clamp(0.0, 4.0)
+            } else {
+                1.0
+            };
             *g = self.smooth_coeff * *g + (1.0 - self.smooth_coeff) * clamped;
         }
 
@@ -177,16 +194,27 @@ impl LinkwitzRiley3Band {
 struct TptShelfBell {
     ic1: [f64; 2],
     ic2: [f64; 2],
-    fc: f64,
+    base_g: f64,
     q: f64,
 }
 
 impl TptShelfBell {
     fn new(fc: f64, q: f64) -> Self {
+        let fs = f64::from(SAMPLE_RATE);
+        let fc = if fc.is_finite() {
+            fc.clamp(15.0, 0.45 * fs)
+        } else {
+            1000.0
+        };
+        let q = if q.is_finite() {
+            q.clamp(0.3, 12.0)
+        } else {
+            std::f64::consts::FRAC_1_SQRT_2
+        };
         Self {
             ic1: [0.0; 2],
             ic2: [0.0; 2],
-            fc,
+            base_g: (PI * fc / fs).tan(),
             q,
         }
     }
@@ -198,6 +226,7 @@ impl TptShelfBell {
 
     #[inline]
     fn tick(&mut self, ch: usize, v0: f64, g: f64, k: f64, m: [f64; 3]) -> f64 {
+        let v0 = if v0.is_finite() { v0 } else { 0.0 };
         let a1 = 1.0 / (1.0 + g * (g + k));
         let a2 = g * a1;
         let a3 = g * a2;
@@ -211,8 +240,13 @@ impl TptShelfBell {
 
     #[inline]
     fn process_low_shelf(&mut self, frame: [f64; 2], gain_db: f64) -> [f64; 2] {
-        let a = 10.0_f64.powf(gain_db.clamp(-48.0, 12.0) / 40.0);
-        let g = (PI * self.fc / f64::from(SAMPLE_RATE)).tan() / a.sqrt();
+        let db = if gain_db.is_finite() {
+            gain_db.clamp(-48.0, 12.0)
+        } else {
+            0.0
+        };
+        let a = 10.0_f64.powf(db / 40.0);
+        let g = self.base_g / a.sqrt();
         let k = 1.0 / self.q;
         let m = [1.0, k * (a - 1.0), a * a - 1.0];
         [
@@ -223,8 +257,13 @@ impl TptShelfBell {
 
     #[inline]
     fn process_bell(&mut self, frame: [f64; 2], gain_db: f64) -> [f64; 2] {
-        let a = 10.0_f64.powf(gain_db.clamp(-48.0, 12.0) / 40.0);
-        let g = (PI * self.fc / f64::from(SAMPLE_RATE)).tan();
+        let db = if gain_db.is_finite() {
+            gain_db.clamp(-48.0, 12.0)
+        } else {
+            0.0
+        };
+        let a = 10.0_f64.powf(db / 40.0);
+        let g = self.base_g;
         let k = 1.0 / (self.q * a);
         let m = [1.0, k * (a * a - 1.0), 0.0];
         [
@@ -235,8 +274,13 @@ impl TptShelfBell {
 
     #[inline]
     fn process_high_shelf(&mut self, frame: [f64; 2], gain_db: f64) -> [f64; 2] {
-        let a = 10.0_f64.powf(gain_db.clamp(-48.0, 12.0) / 40.0);
-        let g = (PI * self.fc / f64::from(SAMPLE_RATE)).tan() * a.sqrt();
+        let db = if gain_db.is_finite() {
+            gain_db.clamp(-48.0, 12.0)
+        } else {
+            0.0
+        };
+        let a = 10.0_f64.powf(db / 40.0);
+        let g = self.base_g * a.sqrt();
         let k = 1.0 / self.q;
         let m = [a * a, k * (1.0 - a) * a, 1.0 - a * a];
         [
@@ -278,8 +322,14 @@ impl TptShelving3Band {
 
     #[inline]
     pub fn process_linear_gains(&mut self, frame: [f64; 2], target_linear: [f64; 3]) -> [f64; 2] {
+        let frame = [
+            if frame[0].is_finite() { frame[0] } else { 0.0 },
+            if frame[1].is_finite() { frame[1] } else { 0.0 },
+        ];
         for (g_db, &lin) in self.gains_db.iter_mut().zip(target_linear.iter()) {
-            let target_db = if lin <= 1e-4 {
+            let target_db = if !lin.is_finite() {
+                0.0
+            } else if lin <= 1e-4 {
                 -48.0
             } else {
                 (20.0 * lin.log10()).clamp(-48.0, 12.0)
@@ -370,33 +420,58 @@ impl DeckFilter {
         target_cutoff_hz: f64,
         target_q: f64,
     ) -> [f64; 2] {
+        let frame = [
+            if frame[0].is_finite() { frame[0] } else { 0.0 },
+            if frame[1].is_finite() { frame[1] } else { 0.0 },
+        ];
         let fs = f64::from(SAMPLE_RATE);
-        let fc = target_cutoff_hz.clamp(15.0, 0.45 * fs);
-        let q = target_q.clamp(0.5, 10.0);
+        let fc = if target_cutoff_hz.is_finite() {
+            target_cutoff_hz.clamp(15.0, 0.45 * fs)
+        } else {
+            self.log_cutoff.exp()
+        };
+        let q = if target_q.is_finite() {
+            target_q.clamp(0.5, 10.0)
+        } else {
+            self.q
+        };
 
-        let target_wet = if target_mode == FilterMode::Bypass {
+        // Never flip instantaneously between LowPass and HighPass while wet; fade through
+        // dry (`wet -> 0`), reset the SVF integrators, snap the new mode/cutoff, then fade in.
+        let switching_mode = target_mode != FilterMode::Bypass
+            && self.mode != FilterMode::Bypass
+            && target_mode != self.mode;
+
+        let target_wet = if target_mode == FilterMode::Bypass || (switching_mode && self.wet > 1e-3)
+        {
             0.0
         } else {
-            if self.mode == FilterMode::Bypass || self.wet < 1e-4 {
+            if self.mode == FilterMode::Bypass || self.wet <= 1e-3 {
+                if self.mode != target_mode {
+                    self.svf.reset();
+                }
                 self.mode = target_mode;
                 self.log_cutoff = fc.ln();
                 self.q = q;
-            } else if target_mode != self.mode {
-                self.mode = target_mode;
             }
             1.0
         };
 
         self.wet = self.wet_smooth * self.wet + (1.0 - self.wet_smooth) * target_wet;
-        if self.wet < 1e-6 && target_wet == 0.0 {
+        if self.wet < 1e-6 && target_mode == FilterMode::Bypass {
             self.wet = 0.0;
             self.mode = FilterMode::Bypass;
+            self.svf.reset();
             return frame;
         }
 
-        self.log_cutoff =
-            self.cutoff_smooth * self.log_cutoff + (1.0 - self.cutoff_smooth) * fc.ln();
-        self.q = self.cutoff_smooth * self.q + (1.0 - self.cutoff_smooth) * q;
+        // Freeze cutoff and resonance while fading out to Bypass or across a mode switch so
+        // dummy bypass cutoffs never sweep back through the audible midband while still wet.
+        if target_wet > 0.0 {
+            self.log_cutoff =
+                self.cutoff_smooth * self.log_cutoff + (1.0 - self.cutoff_smooth) * fc.ln();
+            self.q = self.cutoff_smooth * self.q + (1.0 - self.cutoff_smooth) * q;
+        }
         self.svf.set_params(self.log_cutoff.exp(), self.q);
 
         let filtered = match self.mode {
