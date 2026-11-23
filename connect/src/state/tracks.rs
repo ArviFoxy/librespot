@@ -363,11 +363,17 @@ impl<'ct> ConnectState {
         Ok(())
     }
 
+    fn first_playable_next_track(&self) -> Option<&ProvidedTrack> {
+        self.next_tracks().iter().find(|t| {
+            !t.uid.starts_with(IDENTIFIER_DELIMITER) && !t.is_unavailable() && !t.uri.is_empty()
+        })
+    }
+
     pub fn preview_next_track(&mut self) -> Option<SpotifyUri> {
         let next = if self.repeat_track() {
             self.current_track(|t| &t.uri)
         } else {
-            &self.next_tracks().first()?.uri
+            &self.first_playable_next_track()?.uri
         };
 
         SpotifyUri::from_uri(next).ok()
@@ -384,7 +390,7 @@ impl<'ct> ConnectState {
         let next = if self.repeat_track() {
             current.clone()
         } else {
-            self.next_tracks().first()?.clone()
+            self.first_playable_next_track()?.clone()
         };
         if next.uri.is_empty() {
             return None;

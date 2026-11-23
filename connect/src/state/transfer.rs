@@ -14,7 +14,10 @@ use crate::{
 use protobuf::MessageField;
 
 fn is_transfer_mix_key(key: &str) -> bool {
-    key.starts_with("audio.fade_") || key.starts_with("automix.")
+    key.starts_with("audio.fade_")
+        || key.starts_with("automix.")
+        || key.starts_with("mix.")
+        || matches!(key, "transition_recipe" | "is_mixed" | "mixer_enabled")
 }
 
 fn context_track_canonical_uri(track: &ContextTrack) -> Option<String> {
@@ -259,6 +262,22 @@ impl ConnectState {
             }
             if let Some(uri) = context_track_canonical_uri(track) {
                 by_uri.entry(uri).or_insert(&track.metadata);
+            }
+        }
+
+        // Also merge context-level mix metadata preserved from the transferring session
+        // (drained into `player.context_metadata` by `handle_initial_transfer`) into the
+        // resolved context without overwriting fresh keys.
+        let transferred_ctx_mix: HashMap<String, String> = self
+            .player()
+            .context_metadata
+            .iter()
+            .filter(|(k, v)| is_transfer_mix_key(k) && !v.is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !transferred_ctx_mix.is_empty() {
+            if let Ok(ctx) = self.get_context_mut(self.active_context) {
+                insert_mix_metadata(&mut ctx.metadata, &transferred_ctx_mix);
             }
         }
 

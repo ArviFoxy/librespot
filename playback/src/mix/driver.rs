@@ -283,7 +283,7 @@ impl<M> ActiveTransition<M> {
         }
 
         if !mixed.is_empty() {
-            limiter.process_post_mix(&mut mixed, config, volume);
+            limiter.process_transition_post_mix(&mut mixed, config, volume);
         }
 
         let mut handoff_due_ms = None;
@@ -332,7 +332,7 @@ impl<M> ActiveTransition<M> {
             }
         }
         if !out.is_empty() {
-            limiter.process_post_mix(&mut out, config, volume);
+            limiter.process_transition_post_mix(&mut out, config, volume);
         }
         out
     }

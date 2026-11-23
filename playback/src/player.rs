@@ -130,60 +130,15 @@ impl MasterLimiter {
     ) {
         match (config.normalisation, config.normalisation_method) {
             (true, NormalisationMethod::Dynamic) => {
-                let threshold_db = config.normalisation_threshold_dbfs;
-                let knee_db = config.normalisation_knee_db;
-                let attack_cf = config.normalisation_attack_cf;
-                let release_cf = config.normalisation_release_cf;
-
-                for sample in data.iter_mut() {
-                    // Feedforward limiter in the log domain
-                    // After: Giannoulis, D., Massberg, M., & Reiss, J.D. (2012).
-                    // Digital Dynamic Range Compressor Design—A Tutorial and
-                    // Analysis. Journal of The Audio Engineering Society, 60,
-                    // 399-408.
-                    //
-                    // Assumes interleaved stereo audio.
-
-                    // step 1-4: half-wave rectification and conversion into dB, and
-                    // gain computer with soft knee and subtractor
-                    let limiter_db = {
-                        // Add slight DC offset. Some samples are silence, which is
-                        // -inf dB and gets the limiter stuck. Adding a small
-                        // positive offset prevents this.
-                        *sample += f64::MIN_POSITIVE;
-
-                        let bias_db = ratio_to_db(sample.abs()) - threshold_db;
-                        let knee_boundary_db = bias_db * 2.0;
-                        if knee_boundary_db < -knee_db {
-                            0.0
-                        } else if knee_boundary_db.abs() <= knee_db {
-                            let term = knee_boundary_db + knee_db;
-                            term * term * self.knee_factor
-                        } else {
-                            bias_db
-                        }
-                    };
-
-                    // track left/right channel
-                    let channel = self.channel;
-                    self.channel ^= 1;
-
-                    // step 5: smooth, decoupled peak detector for each channel
-                    let integrator = &mut self.integrators[channel];
-                    let peak = &mut self.peaks[channel];
-
-                    *integrator = f64::max(
-                        limiter_db,
-                        release_cf * *integrator + (1.0 - release_cf) * limiter_db,
-                    );
-                    *peak = attack_cf * *peak + (1.0 - attack_cf) * *integrator;
-
-                    // steps 6-8: conversion into level and multiplication into gain
-                    // stage. Find maximum peak across both channels to couple the
-                    // gain and maintain stereo imaging.
-                    let max_peak = f64::max(self.peaks[0], self.peaks[1]);
-                    *sample *= db_to_ratio(-max_peak) * volume;
-                }
+                self.run_feedforward_limiter(
+                    data,
+                    config.normalisation_threshold_dbfs,
+                    config.normalisation_knee_db,
+                    self.knee_factor,
+                    config.normalisation_attack_cf,
+                    config.normalisation_release_cf,
+                    volume,
+                );
             }
             (false, _) | (true, NormalisationMethod::Basic) => {
                 if volume < 1.0 {
@@ -192,6 +147,101 @@ impl MasterLimiter {
                     }
                 }
             }
+        }
+    }
+
+    /// Post-mix master stage for dual-deck transitions: uses the configured dynamic limiter when
+    /// enabled, and engages a transparent `-0.5 dBFS` safety ceiling limiter when dynamic
+    /// normalisation is disabled so full-overlap DJ transitions never hard-clip.
+    #[cfg(feature = "mix-transitions")]
+    pub(crate) fn process_transition_post_mix(
+        &mut self,
+        data: &mut [f64],
+        config: &PlayerConfig,
+        volume: f64,
+    ) {
+        match (config.normalisation, config.normalisation_method) {
+            (true, NormalisationMethod::Dynamic) => {
+                self.process_post_mix(data, config, volume);
+            }
+            (false, _) | (true, NormalisationMethod::Basic) => {
+                const SAFETY_THRESHOLD_DB: f64 = -0.5;
+                const SAFETY_KNEE_DB: f64 = 1.0;
+                const SAFETY_KNEE_FACTOR: f64 = 1.0 / (8.0 * SAFETY_KNEE_DB);
+                let attack_cf = (-1.0 / (0.0005 * f64::from(SAMPLE_RATE))).exp();
+                let release_cf = (-1.0 / (0.080 * f64::from(SAMPLE_RATE))).exp();
+                self.run_feedforward_limiter(
+                    data,
+                    SAFETY_THRESHOLD_DB,
+                    SAFETY_KNEE_DB,
+                    SAFETY_KNEE_FACTOR,
+                    attack_cf,
+                    release_cf,
+                    volume,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_feedforward_limiter(
+        &mut self,
+        data: &mut [f64],
+        threshold_db: f64,
+        knee_db: f64,
+        knee_factor: f64,
+        attack_cf: f64,
+        release_cf: f64,
+        volume: f64,
+    ) {
+        for sample in data.iter_mut() {
+            // Feedforward limiter in the log domain
+            // After: Giannoulis, D., Massberg, M., & Reiss, J.D. (2012).
+            // Digital Dynamic Range Compressor Design—A Tutorial and
+            // Analysis. Journal of The Audio Engineering Society, 60,
+            // 399-408.
+            //
+            // Assumes interleaved stereo audio.
+
+            // step 1-4: half-wave rectification and conversion into dB, and
+            // gain computer with soft knee and subtractor
+            let limiter_db = {
+                // Add slight DC offset. Some samples are silence, which is
+                // -inf dB and gets the limiter stuck. Adding a small
+                // positive offset prevents this.
+                *sample += f64::MIN_POSITIVE;
+
+                let bias_db = ratio_to_db(sample.abs()) - threshold_db;
+                let knee_boundary_db = bias_db * 2.0;
+                if knee_boundary_db < -knee_db {
+                    0.0
+                } else if knee_boundary_db.abs() <= knee_db {
+                    let term = knee_boundary_db + knee_db;
+                    term * term * knee_factor
+                } else {
+                    bias_db
+                }
+            };
+
+            // track left/right channel
+            let channel = self.channel;
+            self.channel ^= 1;
+
+            // step 5: smooth, decoupled peak detector for each channel
+            let integrator = &mut self.integrators[channel];
+            let peak = &mut self.peaks[channel];
+
+            *integrator = f64::max(
+                limiter_db,
+                release_cf * *integrator + (1.0 - release_cf) * limiter_db,
+            );
+            *peak = attack_cf * *peak + (1.0 - attack_cf) * *integrator;
+
+            // steps 6-8: conversion into level and multiplication into gain
+            // stage. Find maximum peak across both channels to couple the
+            // gain and maintain stereo imaging.
+            let max_peak = f64::max(self.peaks[0], self.peaks[1]);
+            *sample *= db_to_ratio(-max_peak) * volume;
         }
     }
 }
@@ -274,6 +324,7 @@ enum PlayerCommand {
     },
     #[cfg(feature = "mix-transitions")]
     ScheduleTransition {
+        outgoing_track_id: SpotifyUri,
         next_track_id: SpotifyUri,
         spec: Box<TransitionSpec>,
     },
@@ -734,8 +785,14 @@ impl Player {
     }
 
     #[cfg(feature = "mix-transitions")]
-    pub fn schedule_transition(&self, next_track_id: SpotifyUri, spec: TransitionSpec) {
+    pub fn schedule_transition(
+        &self,
+        outgoing_track_id: SpotifyUri,
+        next_track_id: SpotifyUri,
+        spec: TransitionSpec,
+    ) {
         self.command(PlayerCommand::ScheduleTransition {
+            outgoing_track_id,
             next_track_id,
             spec: Box::new(spec),
         });
@@ -882,6 +939,7 @@ struct PlayerLoadedTrackData {
 
 #[cfg(feature = "mix-transitions")]
 struct ScheduledTransition {
+    outgoing_track_id: SpotifyUri,
     next_track_id: SpotifyUri,
     spec: TransitionSpec,
     /// Avoid repeating the missed-entry warning while playback stays past `start_a_frame`
@@ -2315,7 +2373,16 @@ impl PlayerInternal {
 
         #[cfg(feature = "mix-transitions")]
         if let Some(mut deck) = aborted_matching_deck {
-            let stream_position_ms = deck.decoder.seek(position_ms)?;
+            let stream_position_ms = match deck.decoder.seek(position_ms) {
+                Ok(pos) => pos,
+                Err(e) => {
+                    self.send_event(PlayerEvent::Unavailable {
+                        track_id,
+                        play_request_id,
+                    });
+                    return Err(e.into());
+                }
+            };
             let meta = deck.meta;
             let loaded_track = PlayerLoadedTrackData {
                 decoder: deck.decoder,
@@ -2512,7 +2579,7 @@ impl PlayerInternal {
         } = &self.preload
         {
             #[cfg(feature = "mix-transitions")]
-            let starts_at_zero = start_frame.is_none();
+            let starts_at_zero = start_frame.is_none() || *start_frame == Some(0);
             #[cfg(not(feature = "mix-transitions"))]
             let starts_at_zero = true;
 
@@ -2622,9 +2689,11 @@ impl PlayerInternal {
                 let was_paused = active.is_paused();
                 let (deck, restored) = active.into_abort_for_seek();
                 if let Some((mut incoming_deck, spec)) = restored {
+                    let outgoing_track_id = deck.meta.track_id.clone();
                     let next_track_id = incoming_deck.meta.track_id.clone();
                     let target_b_frame = spec.start_b_frame;
                     self.scheduled_transition = Some(ScheduledTransition {
+                        outgoing_track_id,
                         next_track_id: next_track_id.clone(),
                         spec,
                         missed_entry_logged: false,
@@ -2792,13 +2861,14 @@ impl PlayerInternal {
 
             #[cfg(feature = "mix-transitions")]
             PlayerCommand::ScheduleTransition {
+                outgoing_track_id,
                 next_track_id,
                 spec,
-            } => self.handle_command_schedule_transition(next_track_id, *spec),
+            } => self.handle_command_schedule_transition(outgoing_track_id, next_track_id, *spec),
 
             #[cfg(feature = "mix-transitions")]
             PlayerCommand::CancelTransition => {
-                self.scheduled_transition = None;
+                self.handle_command_cancel_transition();
             }
 
             PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
@@ -2961,8 +3031,85 @@ impl PlayerInternal {
     }
 
     #[cfg(feature = "mix-transitions")]
+    fn current_active_track_id(&self) -> Option<&SpotifyUri> {
+        match &self.state {
+            PlayerState::Loading { track_id, .. }
+            | PlayerState::Playing { track_id, .. }
+            | PlayerState::Paused { track_id, .. } => Some(track_id),
+            PlayerState::Transitioning(active) => Some(&active.reported_meta().track_id),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn handle_command_cancel_transition(&mut self) {
+        self.scheduled_transition = None;
+        // If a pre-commit transition is currently running (ConnectState still displays Deck A),
+        // abort back to outgoing Deck A with an anti-click fade so TransitionCommit(B) cannot
+        // fire against a mutated queue/option state.
+        let abort_pre_commit = matches!(
+            &self.state,
+            PlayerState::Transitioning(active) if !active.is_committed()
+        );
+        if abort_pre_commit {
+            self.drain_active_transition_abort_fade();
+            if let PlayerState::Transitioning(active) =
+                mem::replace(&mut self.state, PlayerState::Invalid)
+            {
+                let was_paused = active.is_paused();
+                let pos_ms = active.reported_position_ms();
+                let (deck, _) = active.into_abort_for_seek();
+                let meta = deck.meta;
+                let track_id = meta.track_id.clone();
+                let play_request_id = meta.play_request_id;
+                self.state = if was_paused {
+                    PlayerState::Paused {
+                        track_id: meta.track_id,
+                        play_request_id: meta.play_request_id,
+                        decoder: deck.decoder,
+                        audio_item: meta.audio_item,
+                        normalisation_data: meta.normalisation_data,
+                        normalisation_factor: deck.normalisation_factor,
+                        stream_loader_controller: meta.stream_loader_controller,
+                        bytes_per_second: meta.bytes_per_second,
+                        duration_ms: meta.duration_ms,
+                        stream_position_ms: pos_ms,
+                        suggested_to_preload_next_track: false,
+                        is_explicit: meta.is_explicit,
+                        pending_normalized_pcm: VecDeque::new(),
+                    }
+                } else {
+                    PlayerState::Playing {
+                        track_id: meta.track_id,
+                        play_request_id: meta.play_request_id,
+                        decoder: deck.decoder,
+                        audio_item: meta.audio_item,
+                        normalisation_data: meta.normalisation_data,
+                        normalisation_factor: deck.normalisation_factor,
+                        stream_loader_controller: meta.stream_loader_controller,
+                        bytes_per_second: meta.bytes_per_second,
+                        duration_ms: meta.duration_ms,
+                        stream_position_ms: pos_ms,
+                        reported_nominal_start_time: Instant::now()
+                            .checked_sub(Duration::from_millis(u64::from(pos_ms))),
+                        suggested_to_preload_next_track: false,
+                        is_explicit: meta.is_explicit,
+                        pending_normalized_pcm: VecDeque::new(),
+                    }
+                };
+                self.send_event(PlayerEvent::PositionCorrection {
+                    play_request_id,
+                    track_id,
+                    position_ms: pos_ms,
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "mix-transitions")]
     fn handle_command_schedule_transition(
         &mut self,
+        outgoing_track_id: SpotifyUri,
         next_track_id: SpotifyUri,
         spec: TransitionSpec,
     ) {
@@ -2970,11 +3117,18 @@ impl PlayerInternal {
             debug!("Ignoring scheduled transition because passthrough mode is enabled");
             return;
         }
+        if self.current_active_track_id() != Some(&outgoing_track_id) {
+            debug!(
+                "Ignoring stale scheduled transition <{outgoing_track_id}> -> <{next_track_id}> (active track mismatch)"
+            );
+            return;
+        }
         debug!(
             "Scheduled mix transition to <{next_track_id}> at frame {} -> {}",
             spec.start_a_frame, spec.start_b_frame
         );
         self.scheduled_transition = Some(ScheduledTransition {
+            outgoing_track_id,
             next_track_id,
             spec,
             missed_entry_logged: false,
@@ -3032,6 +3186,26 @@ impl PlayerInternal {
         };
         if already_matching {
             return;
+        }
+
+        // Reuse an already-Ready preload for the same track by exact-seeking in place instead of
+        // re-downloading the track over the network.
+        if let PlayerPreload::Ready {
+            track_id,
+            start_frame,
+            loaded_track,
+        } = &mut self.preload
+        {
+            if *track_id == target_id {
+                if let Ok(actual) = loaded_track.decoder.seek_exact(target_frame) {
+                    if actual == target_frame {
+                        *start_frame = Some(target_frame);
+                        loaded_track.stream_position_ms =
+                            ((actual * 1000) / u64::from(SAMPLE_RATE)) as u32;
+                        return;
+                    }
+                }
+            }
         }
 
         let loader = self.load_track(target_id.clone(), 0, Some(target_frame));
@@ -3139,7 +3313,9 @@ impl PlayerInternal {
             return false;
         };
 
-        if start_frame != Some(sched.spec.start_b_frame) {
+        let already_at_target = start_frame == Some(sched.spec.start_b_frame)
+            || (sched.spec.start_b_frame == 0 && start_frame.is_none());
+        if !already_at_target {
             if let Err(e) = loaded_track.decoder.seek_exact(sched.spec.start_b_frame) {
                 warn!(
                     "Failed to exact-seek incoming track <{incoming_track_id}> to frame {} ({e}); falling back to gapless EOF",
@@ -3166,7 +3342,15 @@ impl PlayerInternal {
                 .write(AudioPacket::Samples(prefix), &mut self.converter)
             {
                 error!("{e}");
+                let target_b_frame = sched.spec.start_b_frame;
                 self.handle_pause();
+                self.scheduled_transition = Some(sched);
+                self.preload = PlayerPreload::Ready {
+                    track_id: incoming_track_id,
+                    start_frame: Some(target_b_frame),
+                    loaded_track,
+                };
+                return false;
             }
         }
 
@@ -3336,6 +3520,14 @@ impl PlayerInternal {
                 is_explicit: meta.is_explicit,
                 pending_normalized_pcm: VecDeque::from(continuation),
             };
+            // Drop any stale scheduled transition that belonged to an earlier outgoing track.
+            if self
+                .scheduled_transition
+                .as_ref()
+                .is_some_and(|s| s.outgoing_track_id != exit_track_id)
+            {
+                self.scheduled_transition = None;
+            }
             // Re-sync Spirc's wall-clock position estimate if tempo stretching drifted >100 ms
             // during the post-commit half of the transition.
             self.send_event(PlayerEvent::PositionCorrection {

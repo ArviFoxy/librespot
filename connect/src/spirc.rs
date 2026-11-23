@@ -634,9 +634,9 @@ impl SpircTask {
                     }).await
                 }, if allow_context_resolving && self.context_resolver.has_next() => {
                     let update_state = self.handle_next_context(next_context);
-                    #[cfg(feature = "mix-transitions")]
-                    self.trigger_transition_resolve();
                     if update_state {
+                        #[cfg(feature = "mix-transitions")]
+                        self.trigger_transition_resolve();
                         if let Err(why) = self.notify().await {
                             error!("update after context resolving failed: {why}")
                         }
@@ -1829,6 +1829,8 @@ impl SpircTask {
     fn handle_unavailable(&mut self, track_id: &SpotifyUri) -> Result<(), Error> {
         self.connect_state.mark_unavailable(track_id)?;
         self.handle_preload_next_track();
+        #[cfg(feature = "mix-transitions")]
+        self.trigger_transition_resolve();
 
         Ok(())
     }
@@ -2010,8 +2012,11 @@ impl SpircTask {
             return;
         }
         if let Some(spec) = resolved.spec {
-            self.player
-                .schedule_transition(resolved.next_track_id, spec);
+            self.player.schedule_transition(
+                resolved.current_track_id,
+                resolved.next_track_id,
+                spec,
+            );
         }
     }
 
@@ -2024,8 +2029,9 @@ impl SpircTask {
     ) -> Result<(), Error> {
         if !self.connect_state.commit_transition_to(incoming_track_id)? {
             warn!(
-                "TransitionCommit for <{incoming_track_id}> did not match next track in ConnectState; keeping existing queue intact"
+                "TransitionCommit for <{incoming_track_id}> did not match next track in ConnectState; keeping existing queue and play_request_id intact"
             );
+            return Ok(());
         }
 
         self.add_autoplay_resolving_when_required();
