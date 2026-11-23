@@ -608,7 +608,7 @@ pub fn transition_from_fade_metadata(
                 (ba - folded_b).abs() <= 0.75 && beatmatchable_genre && fade_out_dur_ms >= 4_000;
 
             if bpm_ratio <= config.max_bpm_ratio.max(1.0)
-                && (durations_match_bpm || same_bpm_beatmatched || beatmatchable_genre)
+                && (durations_match_bpm || same_bpm_beatmatched)
             {
                 let beats_per_bar = track_a
                     .meta
@@ -745,14 +745,8 @@ fn vocal_prob_at(va: &VocalActivity, sec: f64) -> f64 {
     if idx < 0 || idx as usize >= va.vocal_activity_probabilities.len() {
         return 0.0;
     }
-    let max_val = va
-        .vocal_activity_probabilities
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(100);
-    let scale = if max_val > 100 { 1000.0 } else { 100.0 };
-    (f64::from(va.vocal_activity_probabilities[idx as usize]) / scale).clamp(0.0, 1.0)
+    // Spotify encodes `vocal_activity_probabilities` as integer percentages in `[0, 100]`.
+    (f64::from(va.vocal_activity_probabilities[idx as usize]) / 100.0).clamp(0.0, 1.0)
 }
 
 /// Estimate vocal clash energy `mean_t(v_a(t) * v_b(t))` over an overlap window.
@@ -921,7 +915,7 @@ fn cue_bonus(c: &Cuepoint, is_best: bool) -> f64 {
 }
 
 /// Synthesize an Auto DJ transition from track analysis metadata (`BEATS`, `CUEPOINTS`,
-/// `VOCAL_ACTIVITY`, `AUDIO_ATTRIBUTES_V2`, `MIXABILITY`), mirroring Spotify's `core-automix` rules.
+/// `VOCAL_ACTIVITY`, `AUDIO_ATTRIBUTES_V2`, `MIXABILITY`).
 pub fn synthesize_auto_transition(
     meta_a: &TrackMixMetadata,
     meta_b: &TrackMixMetadata,
@@ -933,7 +927,7 @@ pub fn synthesize_auto_transition(
 
     let dur_a_sec = effective_duration_sec(meta_a);
     let dur_b_sec = effective_duration_sec(meta_b);
-    if dur_a_sec > 0.0 && dur_a_sec < 12.0 {
+    if (dur_a_sec > 0.0 && dur_a_sec < 12.0) || (dur_b_sec > 0.0 && dur_b_sec < 12.0) {
         return None;
     }
 
@@ -943,12 +937,12 @@ pub fn synthesize_auto_transition(
         && meta_b.beatmatchability.unwrap_or(1.0) >= 0.25;
 
     let beatmatch_bpm = match (bpm_a, bpm_b) {
-        (Some(ba), Some(bb))
-            if beatmatchable_genre && config.stretch_mode != TimeStretchMode::Off =>
-        {
+        (Some(ba), Some(bb)) if beatmatchable_genre => {
             let folded_b = fold_bpm_octave(ba, bb);
             let ratio = (folded_b / ba).max(ba / folded_b);
-            if ratio <= config.max_bpm_ratio.max(1.0) {
+            let stretch_allowed =
+                config.stretch_mode != TimeStretchMode::Off || (ba - folded_b).abs() <= 0.05;
+            if stretch_allowed && ratio <= config.max_bpm_ratio.max(1.0) {
                 Some((ba, bb, folded_b))
             } else {
                 None
@@ -1108,7 +1102,13 @@ pub fn synthesize_auto_transition(
         return None;
     }
     let start_a = end_a - fade_sec;
-    let start_b = in_cues[0].0;
+    let mut start_b = in_cues[0].0;
+    if dur_b_sec > 0.0 && start_b + fade_sec > dur_b_sec {
+        start_b = 0.0;
+        if fade_sec >= dur_b_sec {
+            return None;
+        }
+    }
 
     let preset = BuiltinPreset::SimpleFade;
     let (out_curves, in_curves) = curves_for_builtin_preset(preset);
@@ -1132,8 +1132,8 @@ struct ResolverCache {
     /// Cached `MIX_STATE.is_mixed` per playlist URI.
     playlist_mixed: HashMap<String, bool>,
     playlist_order: VecDeque<String>,
-    /// Cached per-playlist user-made recipes keyed by `(playlist_uri, track_a_uri, track_b_uri)`.
-    playlist_recipes: HashMap<String, Vec<Transition>>,
+    /// Cached per-playlist user-made recipes (`Some` once `playlist4` has been queried).
+    playlist_recipes: HashMap<String, Option<Vec<Transition>>>,
 }
 
 impl ResolverCache {
@@ -1149,7 +1149,7 @@ impl ResolverCache {
         self.tracks.insert(uri, meta);
     }
 
-    fn insert_playlist(&mut self, uri: String, is_mixed: bool, recipes: Vec<Transition>) {
+    fn insert_playlist(&mut self, uri: String, is_mixed: bool, recipes: Option<Vec<Transition>>) {
         if !self.playlist_mixed.contains_key(&uri) {
             if self.playlist_order.len() >= MAX_CACHED_CONTEXTS {
                 if let Some(evict) = self.playlist_order.pop_front() {
@@ -1166,6 +1166,7 @@ impl ResolverCache {
     fn invalidate_playlist(&mut self, uri: &str) {
         self.playlist_mixed.remove(uri);
         self.playlist_recipes.remove(uri);
+        self.playlist_order.retain(|u| u != uri);
     }
 }
 
@@ -1239,31 +1240,29 @@ impl TransitionResolver {
         }
 
         // 3. Priority 1: explicit user-made `transition_recipe` from track metadata or playlist4.
-        if let Some(proto) = find_track_metadata_recipe(&req.current_metadata, &req.next_metadata)
-            .or_else(|| {
-                find_matching_playlist_recipe(
-                    &playlist_recipes,
-                    &uri_a,
-                    &req.current_row_uid,
-                    &uri_b,
-                    &req.next_row_uid,
-                )
-            })
+        // Try all decoded candidates so a stale/mismatched recipe on Track A cannot shadow a valid
+        // recipe on Track B or in `playlist4`.
+        let track_candidates =
+            collect_track_metadata_recipes(&req.current_metadata, &req.next_metadata);
+        let ctx_a = TrackTransitionContext {
+            track_uri: &uri_a,
+            row_uid: &req.current_row_uid,
+            meta: &meta_a,
+        };
+        let ctx_b = TrackTransitionContext {
+            track_uri: &uri_b,
+            row_uid: &req.next_row_uid,
+            meta: &meta_b,
+        };
+        for proto in track_candidates
+            .iter()
+            .chain(playlist_recipes.iter().filter(|tr| {
+                tr.overlap
+                    .as_ref()
+                    .is_some_and(|ov| !ov.track_a_uri.is_empty() || !ov.track_a_row_id.is_empty())
+            }))
         {
-            if let Some(spec) = transition_proto_to_spec(
-                &proto,
-                TrackTransitionContext {
-                    track_uri: &uri_a,
-                    row_uid: &req.current_row_uid,
-                    meta: &meta_a,
-                },
-                TrackTransitionContext {
-                    track_uri: &uri_b,
-                    row_uid: &req.next_row_uid,
-                    meta: &meta_b,
-                },
-                &self.config,
-            ) {
+            if let Some(spec) = transition_proto_to_spec(proto, ctx_a, ctx_b, &self.config) {
                 debug!("Resolved user-made transition recipe for <{uri_a}> -> <{uri_b}>");
                 result.spec = Some(spec);
                 return result;
@@ -1335,12 +1334,17 @@ impl TransitionResolver {
             if let Some(&cached_mixed) = guard.playlist_mixed.get(&req.context_uri) {
                 let active =
                     self.config.mode == MixMode::ForceAuto || explicit_enabled || cached_mixed;
-                let recipes = guard
+                let cached_recipes = guard
                     .playlist_recipes
                     .get(&req.context_uri)
-                    .cloned()
-                    .unwrap_or_default();
-                return (active, recipes);
+                    .and_then(|r| r.as_ref());
+                // Only short-circuit from cache if inactive, OR if playlist4 recipes were already fetched.
+                if !active {
+                    return (false, Vec::new());
+                }
+                if let Some(recipes) = cached_recipes {
+                    return (true, recipes.clone());
+                }
             }
         }
 
@@ -1355,7 +1359,9 @@ impl TransitionResolver {
             .await
         {
             for entry in entries {
-                if entry.kind == ExtensionKind::MIX_STATE {
+                if entry.kind == ExtensionKind::MIX_STATE
+                    && (entry.status_code == 200 || entry.status_code == 0)
+                {
                     if let Ok(ms) = MixState::parse_from_bytes(&entry.data) {
                         is_mixed |= ms.is_mixed;
                     }
@@ -1364,8 +1370,8 @@ impl TransitionResolver {
         }
 
         // If mixed (or ForceAuto), inspect playlist4 attributes for any user-made transition recipes.
-        let mut recipes = Vec::new();
-        if is_mixed || self.config.mode == MixMode::ForceAuto {
+        let fetched_recipes = if is_mixed || self.config.mode == MixMode::ForceAuto {
+            let mut recipes = Vec::new();
             if let Ok(pl_uri) = SpotifyUri::from_uri(&req.context_uri) {
                 if let Ok(pl_id) = SpotifyId::try_from(&pl_uri) {
                     if let Ok(raw) = session.spclient().get_playlist(&pl_id).await {
@@ -1375,13 +1381,19 @@ impl TransitionResolver {
                     }
                 }
             }
-        }
+            Some(recipes)
+        } else {
+            None
+        };
 
-        self.lock_cache()
-            .insert_playlist(req.context_uri.clone(), is_mixed, recipes.clone());
+        self.lock_cache().insert_playlist(
+            req.context_uri.clone(),
+            is_mixed,
+            fetched_recipes.clone(),
+        );
 
         let active = self.config.mode == MixMode::ForceAuto || is_mixed;
-        (active, recipes)
+        (active, fetched_recipes.unwrap_or_default())
     }
 
     async fn fetch_track_pair_metadata(
@@ -1426,16 +1438,28 @@ impl TransitionResolver {
             {
                 Ok(entries) => {
                     let mut parsed: HashMap<String, TrackMixMetadata> = HashMap::new();
+                    let mut cacheable: HashMap<String, bool> = HashMap::new();
                     for u in requested_uris {
-                        parsed.insert(u, TrackMixMetadata::default());
+                        parsed.insert(u.clone(), TrackMixMetadata::default());
+                        cacheable.insert(u, false);
                     }
                     for entry in entries {
-                        let meta = parsed.entry(entry.entity_uri.clone()).or_default();
-                        apply_extension_to_track_meta(meta, entry.kind, &entry.data);
+                        let status = entry.status_code;
+                        // Treat HTTP 200/204/404 (or unset 0) as definitive; skip caching on
+                        // transient 429/5xx per-entry errors so retries can succeed later.
+                        if status == 200 || status == 204 || status == 404 || status == 0 {
+                            cacheable.insert(entry.entity_uri.clone(), true);
+                        }
+                        if status == 200 || status == 0 {
+                            let meta = parsed.entry(entry.entity_uri.clone()).or_default();
+                            apply_extension_to_track_meta(meta, entry.kind, &entry.data);
+                        }
                     }
                     let mut guard = self.lock_cache();
                     for (u, m) in parsed {
-                        guard.insert_track(u, m);
+                        if cacheable.get(&u).copied().unwrap_or(false) {
+                            guard.insert_track(u, m);
+                        }
                     }
                 }
                 Err(e) => {
@@ -1520,46 +1544,21 @@ fn apply_extension_to_track_meta(meta: &mut TrackMixMetadata, kind: ExtensionKin
     }
 }
 
-fn find_track_metadata_recipe(
+fn collect_track_metadata_recipes(
     meta_a: &HashMap<String, String>,
     meta_b: &HashMap<String, String>,
-) -> Option<Transition> {
+) -> Vec<Transition> {
+    let mut out = Vec::new();
     for map in [meta_a, meta_b] {
         for &key in RECIPE_METADATA_KEYS {
             if let Some(val) = map.get(key) {
                 if let Some(tr) = decode_transition_recipe(val) {
-                    return Some(tr);
+                    out.push(tr);
                 }
             }
         }
     }
-    None
-}
-
-fn find_matching_playlist_recipe(
-    recipes: &[Transition],
-    uri_a: &str,
-    row_a_uid: &str,
-    uri_b: &str,
-    row_b_uid: &str,
-) -> Option<Transition> {
-    recipes
-        .iter()
-        .find(|tr| {
-            let Some(ov) = tr.overlap.as_ref() else {
-                return false;
-            };
-            let uri_match = (ov.track_a_uri.is_empty() || ov.track_a_uri == uri_a)
-                && (ov.track_b_uri.is_empty() || ov.track_b_uri == uri_b);
-            let row_match = (ov.track_a_row_id.is_empty()
-                || row_a_uid.is_empty()
-                || ov.track_a_row_id == row_a_uid)
-                && (ov.track_b_row_id.is_empty()
-                    || row_b_uid.is_empty()
-                    || ov.track_b_row_id == row_b_uid);
-            uri_match && row_match && (!ov.track_a_uri.is_empty() || !ov.track_a_row_id.is_empty())
-        })
-        .cloned()
+    out
 }
 
 fn extract_playlist_recipes(

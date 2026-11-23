@@ -687,37 +687,51 @@ pub fn convert_proto_curves(proto: &ProtoCurves) -> AutomationCurves {
         curves: proto
             .curves
             .iter()
-            .map(|c| {
+            .filter_map(|c| {
                 let points: Vec<CurvePoint> = c
                     .points
                     .iter()
+                    .filter(|p| p.x.is_finite() && p.y.is_finite())
                     .map(|p| CurvePoint { x: p.x, y: p.y })
                     .collect();
+                if points.is_empty() {
+                    return None;
+                }
+                let start = if c.start.is_finite() { c.start } else { 0.0 };
+                let end = if c.end.is_finite() { c.end } else { 1.0 };
                 let interpolation = if points.len() >= 4 && (points.len() - 1) % 3 == 0 {
                     CurveInterpolation::CubicBezier
                 } else {
                     CurveInterpolation::Linear
                 };
-                AutomationCurve {
+                Some(AutomationCurve {
                     points,
-                    start: c.start,
-                    end: c.end,
+                    start,
+                    end,
                     interpolation,
-                }
+                })
             })
             .collect(),
-        minimum: proto.minimum,
-        maximum: proto.maximum,
+        minimum: if proto.minimum.is_finite() {
+            proto.minimum
+        } else {
+            0.0
+        },
+        maximum: if proto.maximum.is_finite() {
+            proto.maximum
+        } else {
+            1.0
+        },
     }
 }
 
 fn infer_gain_semantics(proto: &ProtoCurves) -> ValueSemantics {
-    let has_negative = proto.minimum < 0.0
+    let has_negative = (proto.minimum.is_finite() && proto.minimum < 0.0)
         || proto
             .curves
             .iter()
             .flat_map(|c| c.points.iter())
-            .any(|p| p.y < 0.0);
+            .any(|p| p.y.is_finite() && p.y < 0.0);
     if has_negative {
         ValueSemantics {
             output_unit: ValueUnit::Decibels,
@@ -733,23 +747,95 @@ fn infer_gain_semantics(proto: &ProtoCurves) -> ValueSemantics {
     }
 }
 
+fn infer_eq_override_semantics(bands: &[&ProtoCurves]) -> ValueSemantics {
+    let has_negative = bands.iter().any(|proto| {
+        (proto.minimum.is_finite() && proto.minimum < 0.0)
+            || proto
+                .curves
+                .iter()
+                .flat_map(|c| c.points.iter())
+                .any(|p| p.y.is_finite() && p.y < 0.0)
+    });
+    if has_negative {
+        return ValueSemantics {
+            output_unit: ValueUnit::Decibels,
+            mapping: ValueMapping::Identity,
+            special_cases: vec![SpecialCase {
+                raw_min: -200.0,
+                raw_max: -36.0,
+                result: SpecialResult::Role(SpecialRole::Kill),
+            }],
+        };
+    }
+
+    // Detect Spotify's normalized `[0.0, 1.0]` bipolar EQ format (`0.5 = 0 dB unity`) when all
+    // points stay inside `[0, 1]` and peak near `0.5` rather than `1.0`.
+    let mut max_y = 0.0_f64;
+    let mut all_unit_range = true;
+    for proto in bands {
+        if (proto.minimum.is_finite() && proto.minimum < -1e-6)
+            || (proto.maximum.is_finite() && proto.maximum > 1.0 + 1e-6)
+        {
+            all_unit_range = false;
+        }
+        for p in proto.curves.iter().flat_map(|c| c.points.iter()) {
+            if p.y.is_finite() {
+                max_y = max_y.max(p.y);
+                if p.y > 1.0 + 1e-6 {
+                    all_unit_range = false;
+                }
+            }
+        }
+    }
+    if all_unit_range && max_y > 0.25 && max_y <= 0.55 {
+        return bipolar_eq_semantics();
+    }
+
+    ValueSemantics::default()
+}
+
 fn apply_eq_override(ov: &EqCurveOverrides, deck: &mut DeckCurves) {
-    let mut sem = None;
+    let mut bands: Vec<&ProtoCurves> = Vec::with_capacity(3);
     if let Some(low) = ov.low.as_ref() {
-        sem.get_or_insert_with(|| infer_gain_semantics(low));
+        bands.push(low);
+    }
+    if let Some(mid) = ov.mid.as_ref() {
+        bands.push(mid);
+    }
+    if let Some(high) = ov.high.as_ref() {
+        bands.push(high);
+    }
+    if bands.is_empty() {
+        return;
+    }
+
+    let new_sem = infer_eq_override_semantics(&bands);
+    // If the override switches EQ units (e.g., linear `[0, 1]` base preset -> `Decibels` override),
+    // clear non-overridden base EQ bands so linear `0.0` (kill) is never misread as `0 dB` (unity).
+    let prev_unit = deck
+        .eq_semantics
+        .as_ref()
+        .map(|s| s.output_unit)
+        .unwrap_or(ValueUnit::Linear);
+    let semantics_changed = deck.eq_semantics.as_ref() != Some(&new_sem)
+        && (prev_unit != new_sem.output_unit
+            || matches!(new_sem.mapping, ValueMapping::Piecewise(_)));
+    if semantics_changed {
+        deck.eq_low = None;
+        deck.eq_mid = None;
+        deck.eq_high = None;
+    }
+
+    if let Some(low) = ov.low.as_ref() {
         deck.eq_low = Some(convert_proto_curves(low));
     }
     if let Some(mid) = ov.mid.as_ref() {
-        sem.get_or_insert_with(|| infer_gain_semantics(mid));
         deck.eq_mid = Some(convert_proto_curves(mid));
     }
     if let Some(high) = ov.high.as_ref() {
-        sem.get_or_insert_with(|| infer_gain_semantics(high));
         deck.eq_high = Some(convert_proto_curves(high));
     }
-    if let Some(s) = sem {
-        deck.eq_semantics = Some(s);
-    }
+    deck.eq_semantics = Some(new_sem);
 }
 
 fn apply_filter_override(ov: &FilterCurveOverrides, deck: &mut DeckCurves) {
@@ -768,12 +854,40 @@ fn apply_filter_override(ov: &FilterCurveOverrides, deck: &mut DeckCurves) {
 
         // Distinguish direct Hz (> 10), bipolar [-1, 1], or normalized [0, 1] knob convention.
         if max_abs_y > 10.0 {
-            let mode = if has_neg_y {
-                FilterMode::HighPass
+            if has_neg_y {
+                // Signed Hz convention: negative = LP (`|y|` Hz), near 0 = bypass, positive = HP (`y` Hz).
+                deck.filter_cutoff_semantics = Some(ValueSemantics {
+                    output_unit: ValueUnit::Hertz,
+                    special_cases: vec![SpecialCase {
+                        raw_min: -15.0,
+                        raw_max: 15.0,
+                        result: SpecialResult::Role(SpecialRole::Bypass),
+                    }],
+                    mapping: ValueMapping::Piecewise(vec![
+                        InterpolationSegment {
+                            raw_start: -22_050.0,
+                            raw_end: -15.0,
+                            output_start: 22_050.0,
+                            output_end: 15.0,
+                            output_mode: Some(FilterMode::LowPass),
+                            interpolation: SegmentInterpolation::Linear,
+                            easing: SegmentEasing::None,
+                        },
+                        InterpolationSegment {
+                            raw_start: 15.0,
+                            raw_end: 22_050.0,
+                            output_start: 15.0,
+                            output_end: 22_050.0,
+                            output_mode: Some(FilterMode::HighPass),
+                            interpolation: SegmentInterpolation::Linear,
+                            easing: SegmentEasing::None,
+                        },
+                    ]),
+                });
             } else {
-                FilterMode::LowPass
-            };
-            deck.filter_cutoff_semantics = Some(direct_hz_filter_semantics(mode));
+                deck.filter_cutoff_semantics =
+                    Some(direct_hz_filter_semantics(FilterMode::LowPass));
+            }
         } else if has_neg_y {
             // Bipolar [-1, 1]: [-1, -0.02] = LP 20..20kHz, ~0 = bypass, [0.02, 1] = HP 20..20kHz.
             deck.filter_cutoff_semantics = Some(ValueSemantics {
@@ -811,7 +925,20 @@ fn apply_filter_override(ov: &FilterCurveOverrides, deck: &mut DeckCurves) {
         deck.filter_cutoff = Some(converted);
     }
     if let Some(res) = ov.resonance.as_ref() {
-        deck.filter_resonance = Some(convert_proto_curves(res));
+        let converted = convert_proto_curves(res);
+        let max_y = converted
+            .curves
+            .iter()
+            .flat_map(|c| c.points.iter())
+            .fold(0.0_f64, |acc, p| acc.max(p.y));
+        let is_normalized =
+            converted.minimum >= 0.0 && converted.maximum <= 1.0 + 1e-6 && max_y <= 1.0 + 1e-6;
+        deck.filter_resonance_semantics = if is_normalized {
+            Some(bipolar_resonance_semantics())
+        } else {
+            None
+        };
+        deck.filter_resonance = Some(converted);
     }
 }
 
