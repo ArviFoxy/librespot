@@ -11,6 +11,8 @@ pub mod convert;
 pub mod decoder;
 pub mod dither;
 mod local_file;
+#[cfg(feature = "mix-transitions")]
+pub mod mix;
 pub mod mixer;
 pub mod player;
 mod symphonia_util;
