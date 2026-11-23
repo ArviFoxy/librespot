@@ -884,6 +884,9 @@ struct PlayerLoadedTrackData {
 struct ScheduledTransition {
     next_track_id: SpotifyUri,
     spec: TransitionSpec,
+    /// Avoid repeating the missed-entry warning while playback stays past `start_a_frame`
+    /// (keeping the transition armed in case the user scrubs back before `start_a_frame`).
+    missed_entry_logged: bool,
 }
 
 #[cfg(feature = "mix-transitions")]
@@ -2285,13 +2288,21 @@ impl PlayerInternal {
         position_ms: u32,
     ) -> PlayerResult {
         #[cfg(feature = "mix-transitions")]
-        {
+        let aborted_matching_deck = {
             self.scheduled_transition = None;
             if matches!(self.state, PlayerState::Transitioning(_)) {
                 self.drain_active_transition_abort_fade();
-                self.state = PlayerState::Stopped;
+                if let PlayerState::Transitioning(active) =
+                    mem::replace(&mut self.state, PlayerState::Stopped)
+                {
+                    active.into_matching_deck(|m| m.track_id == track_id)
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-        }
+        };
 
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
@@ -2300,6 +2311,31 @@ impl PlayerInternal {
 
         if !self.config.gapless {
             self.ensure_sink_stopped(play);
+        }
+
+        #[cfg(feature = "mix-transitions")]
+        if let Some(mut deck) = aborted_matching_deck {
+            let stream_position_ms = deck.decoder.seek(position_ms)?;
+            let meta = deck.meta;
+            let loaded_track = PlayerLoadedTrackData {
+                decoder: deck.decoder,
+                normalisation_data: meta.normalisation_data,
+                stream_loader_controller: meta.stream_loader_controller,
+                audio_item: meta.audio_item,
+                bytes_per_second: meta.bytes_per_second,
+                duration_ms: meta.duration_ms,
+                stream_position_ms,
+                is_explicit: meta.is_explicit,
+            };
+            self.preload = PlayerPreload::None;
+            self.start_playback(track_id, play_request_id, loaded_track, play);
+            if let PlayerState::Invalid = self.state {
+                return Err(Error::internal(format!(
+                    "PlayerInternal::handle_command_load reusing transition deck: start_playback() did not transition to valid player state: {:?}",
+                    self.state
+                )));
+            }
+            return Ok(());
         }
 
         if matches!(self.state, PlayerState::Invalid) {
@@ -2584,7 +2620,37 @@ impl PlayerInternal {
                 mem::replace(&mut self.state, PlayerState::Invalid)
             {
                 let was_paused = active.is_paused();
-                let deck = active.into_active_deck_for_seek();
+                let (deck, restored) = active.into_abort_for_seek();
+                if let Some((mut incoming_deck, spec)) = restored {
+                    let next_track_id = incoming_deck.meta.track_id.clone();
+                    let target_b_frame = spec.start_b_frame;
+                    self.scheduled_transition = Some(ScheduledTransition {
+                        next_track_id: next_track_id.clone(),
+                        spec,
+                        missed_entry_logged: false,
+                    });
+                    if let Ok(actual_frame) = incoming_deck.decoder.seek_exact(target_b_frame) {
+                        if actual_frame == target_b_frame {
+                            let imeta = incoming_deck.meta;
+                            let stream_pos_ms =
+                                ((actual_frame * 1000) / u64::from(SAMPLE_RATE)) as u32;
+                            self.preload = PlayerPreload::Ready {
+                                track_id: next_track_id,
+                                start_frame: Some(target_b_frame),
+                                loaded_track: Box::new(PlayerLoadedTrackData {
+                                    decoder: incoming_deck.decoder,
+                                    normalisation_data: imeta.normalisation_data,
+                                    stream_loader_controller: imeta.stream_loader_controller,
+                                    audio_item: imeta.audio_item,
+                                    bytes_per_second: imeta.bytes_per_second,
+                                    duration_ms: imeta.duration_ms,
+                                    stream_position_ms: stream_pos_ms,
+                                    is_explicit: imeta.is_explicit,
+                                }),
+                            };
+                        }
+                    }
+                }
                 let meta = deck.meta;
                 self.state = if was_paused {
                     PlayerState::Paused {
@@ -2674,17 +2740,22 @@ impl PlayerInternal {
                         });
                     }
                     #[cfg(feature = "mix-transitions")]
-                    if let Some(ref sched) = self.scheduled_transition {
-                        let seek_frame =
-                            (u64::from(new_position_ms) * u64::from(SAMPLE_RATE)) / 1000;
-                        if seek_frame
-                            > sched
-                                .spec
-                                .start_a_frame
-                                .saturating_add(crate::mix::ENTRY_GRACE_FRAMES)
-                        {
-                            self.scheduled_transition = None;
+                    {
+                        if let Some(ref mut sched) = self.scheduled_transition {
+                            let seek_frame =
+                                (u64::from(new_position_ms) * u64::from(SAMPLE_RATE)) / 1000;
+                            if seek_frame
+                                <= sched
+                                    .spec
+                                    .start_a_frame
+                                    .saturating_add(crate::mix::ENTRY_GRACE_FRAMES)
+                            {
+                                // Keep transition armed across overshoot seeks so dragging past
+                                // `start_a` and back before `start_a` still triggers the mix.
+                                sched.missed_entry_logged = false;
+                            }
                         }
+                        self.maybe_preload_scheduled_transition();
                     }
                 }
                 Err(e) => error!("PlayerInternal::handle_command_seek error: {e}"),
@@ -2906,6 +2977,7 @@ impl PlayerInternal {
         self.scheduled_transition = Some(ScheduledTransition {
             next_track_id,
             spec,
+            missed_entry_logged: false,
         });
         self.maybe_preload_scheduled_transition();
     }
@@ -2931,8 +3003,9 @@ impl PlayerInternal {
 
         let start_a_ms = ((sched.spec.start_a_frame * 1000) / u64::from(SAMPLE_RATE))
             .min(u64::from(duration_ms)) as i64;
-        if start_a_ms - i64::from(stream_position_ms)
-            >= i64::from(PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS)
+        let grace_ms = ((crate::mix::ENTRY_GRACE_FRAMES * 1000) / u64::from(SAMPLE_RATE)) as i64;
+        let delta_ms = start_a_ms - i64::from(stream_position_ms);
+        if delta_ms >= i64::from(PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS) || delta_ms < -grace_ms
         {
             return;
         }
@@ -3016,7 +3089,7 @@ impl PlayerInternal {
         let Some((packet_position, AudioPacket::Samples(samples))) = result else {
             return false;
         };
-        let Some(ref sched) = self.scheduled_transition else {
+        let Some(ref mut sched) = self.scheduled_transition else {
             return false;
         };
         let channels = usize::from(NUM_CHANNELS);
@@ -3034,11 +3107,13 @@ impl PlayerInternal {
         ) {
             EntryPacketDecision::BeforeEntry => return false,
             EntryPacketDecision::PastGraceWindow => {
-                warn!(
-                    "Scheduled transition to <{}> missed entry window at frame {}; falling back to gapless EOF",
-                    sched.next_track_id, sched.spec.start_a_frame
-                );
-                self.scheduled_transition = None;
+                if !sched.missed_entry_logged {
+                    warn!(
+                        "Scheduled transition to <{}> missed entry window at frame {}; falling back to gapless EOF unless scrubbed back",
+                        sched.next_track_id, sched.spec.start_a_frame
+                    );
+                    sched.missed_entry_logged = true;
+                }
                 return false;
             }
             EntryPacketDecision::CrossesEntry { dry_prefix_samples } => dry_prefix_samples,
@@ -3242,6 +3317,8 @@ impl PlayerInternal {
             let (incoming_deck, next_frame, continuation) = active.into_incoming_continuation();
             let meta = incoming_deck.meta;
             let pos_ms = ((next_frame * 1000) / u64::from(SAMPLE_RATE)) as u32;
+            let exit_track_id = meta.track_id.clone();
+            let exit_play_request_id = meta.play_request_id;
             self.state = PlayerState::Playing {
                 track_id: meta.track_id,
                 play_request_id: meta.play_request_id,
@@ -3259,6 +3336,13 @@ impl PlayerInternal {
                 is_explicit: meta.is_explicit,
                 pending_normalized_pcm: VecDeque::from(continuation),
             };
+            // Re-sync Spirc's wall-clock position estimate if tempo stretching drifted >100 ms
+            // during the post-commit half of the transition.
+            self.send_event(PlayerEvent::PositionCorrection {
+                play_request_id: exit_play_request_id,
+                track_id: exit_track_id,
+                position_ms: pos_ms,
+            });
         }
     }
 

@@ -3,7 +3,7 @@ use crate::mix::{
     MixMode,
     resolver::{
         TransitionResolveRequest, TransitionResolveResult, TransitionResolver,
-        context_signals_mixed,
+        classify_context_mix_signal,
     },
 };
 use crate::{
@@ -1149,6 +1149,12 @@ impl SpircTask {
                         self.connect_state.context_uri()
                     )
                 } else {
+                    #[cfg(feature = "mix-transitions")]
+                    {
+                        self.player.cancel_transition();
+                        let ctx_uri = self.connect_state.context_uri().clone();
+                        self.transition_resolver.invalidate_playlist(&ctx_uri);
+                    }
                     self.context_resolver.add(ResolveContext::from_context(
                         update_context.context,
                         ContextType::Default,
@@ -1740,9 +1746,16 @@ impl SpircTask {
     }
 
     fn handle_repeat_context(&mut self, repeat: bool) -> Result<(), Error> {
+        #[cfg(feature = "mix-transitions")]
+        self.player.cancel_transition();
         self.player
             .emit_repeat_changed_event(repeat, self.connect_state.repeat_track());
-        self.connect_state.handle_set_repeat_context(repeat)
+        let res = self.connect_state.handle_set_repeat_context(repeat);
+        #[cfg(feature = "mix-transitions")]
+        if res.is_ok() {
+            self.trigger_transition_resolve();
+        }
+        res
     }
 
     fn handle_repeat_track(&mut self, repeat: bool) {
@@ -1921,7 +1934,9 @@ impl SpircTask {
 
     #[cfg(feature = "mix-transitions")]
     fn trigger_transition_resolve(&mut self) {
-        if self.transition_resolver.config().mode == MixMode::Off {
+        if self.transition_resolver.config().mode == MixMode::Off
+            || self.connect_state.repeat_track()
+        {
             return;
         }
         let Some((current, next, current_duration_ms)) =
@@ -1951,7 +1966,7 @@ impl SpircTask {
             .get_context(ContextType::Default)
             .ok()
             .map(|c| &c.metadata);
-        let signals_mixed = context_signals_mixed(
+        let context_mix_signal = classify_context_mix_signal(
             self.connect_state.modes(),
             ctx_meta,
             Some(&current),
@@ -1961,7 +1976,7 @@ impl SpircTask {
         let req = TransitionResolveRequest {
             generation,
             context_uri: self.connect_state.context_uri().clone(),
-            context_signals_mixed: signals_mixed,
+            context_mix_signal,
             current_track_id,
             current_row_uid: current.uid,
             current_duration_ms,
@@ -2056,11 +2071,7 @@ impl SpircTask {
         #[cfg(feature = "mix-transitions")]
         {
             self.player.cancel_transition();
-            let resolver = self.transition_resolver.clone();
-            let inv_uri = uri.clone();
-            tokio::spawn(async move {
-                resolver.invalidate_playlist(&inv_uri).await;
-            });
+            self.transition_resolver.invalidate_playlist(&uri);
         }
         self.context_resolver.add(ResolveContext::from_uri(
             uri,

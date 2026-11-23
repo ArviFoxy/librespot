@@ -348,11 +348,36 @@ impl<M> ActiveTransition<M> {
 
     /// Consume an aborted transition for a user seek, returning whichever deck the user sees as
     /// current (outgoing Deck A pre-commit, incoming Deck B post-commit).
-    pub fn into_active_deck_for_seek(self) -> TransitionDeck<M> {
+    ///
+    /// When aborted pre-commit, also returns `(incoming_deck, spec)` so the player can keep the
+    /// transition armed (and the incoming deck preloaded) if the user scrubs back before `start_a`.
+    pub fn into_abort_for_seek(
+        self,
+    ) -> (
+        TransitionDeck<M>,
+        Option<(TransitionDeck<M>, TransitionSpec)>,
+    ) {
         if self.committed {
-            self.incoming
+            (self.incoming, None)
         } else {
-            self.outgoing
+            let spec = self.processor.spec().clone();
+            (self.outgoing, Some((self.incoming, spec)))
+        }
+    }
+
+    /// Consume an aborted transition and return whichever deck's metadata satisfies `predicate`
+    /// (checking incoming first, then outgoing), allowing `Load` commands during a transition
+    /// (e.g. Skip Next to Track B) to reuse an already-loaded deck without re-buffering.
+    pub fn into_matching_deck<F>(self, predicate: F) -> Option<TransitionDeck<M>>
+    where
+        F: Fn(&M) -> bool,
+    {
+        if predicate(&self.incoming.meta) {
+            Some(self.incoming)
+        } else if predicate(&self.outgoing.meta) {
+            Some(self.outgoing)
+        } else {
+            None
         }
     }
 }
@@ -652,12 +677,62 @@ mod tests {
                 fade[fade.len() - 2]
             );
 
-            let target = active.into_active_deck_for_seek();
+            let (target, restored) = active.into_abort_for_seek();
             assert_eq!(
                 target.meta,
                 if want_committed { "deck_b" } else { "deck_a" }
             );
+            if want_committed {
+                assert!(restored.is_none());
+            } else {
+                let (incoming, restored_spec) =
+                    restored.expect("pre-commit seek must preserve incoming deck and spec");
+                assert_eq!(incoming.meta, "deck_b");
+                assert_eq!(restored_spec.duration_frames, SAMPLE_RATE as u64);
+            }
         }
+    }
+
+    #[test]
+    fn into_matching_deck_reuses_incoming_or_outgoing_deck_on_manual_load() {
+        let dec_a = SyntheticDecoder::sine(220.0, 0.5, SAMPLE_RATE as usize * 2, 512);
+        let dec_b = SyntheticDecoder::sine(330.0, 0.5, SAMPLE_RATE as usize * 2, 512);
+        let spec = TransitionSpec::equal_power_crossfade(0, 0, SAMPLE_RATE as u64);
+        let make = |a, b, s| {
+            ActiveTransition::new(
+                TransitionDeck {
+                    decoder: Box::new(a),
+                    normalisation_factor: 1.0,
+                    meta: "track_a",
+                },
+                TransitionDeck {
+                    decoder: Box::new(b),
+                    normalisation_factor: 1.0,
+                    meta: "track_b",
+                },
+                s,
+                &[],
+            )
+        };
+
+        let matched_b = make(dec_a, dec_b, spec.clone()).into_matching_deck(|m| *m == "track_b");
+        assert_eq!(matched_b.map(|d| d.meta), Some("track_b"));
+
+        let matched_a = make(
+            SyntheticDecoder::sine(220.0, 0.5, SAMPLE_RATE as usize * 2, 512),
+            SyntheticDecoder::sine(330.0, 0.5, SAMPLE_RATE as usize * 2, 512),
+            spec.clone(),
+        )
+        .into_matching_deck(|m| *m == "track_a");
+        assert_eq!(matched_a.map(|d| d.meta), Some("track_a"));
+
+        let matched_none = make(
+            SyntheticDecoder::sine(220.0, 0.5, SAMPLE_RATE as usize * 2, 512),
+            SyntheticDecoder::sine(330.0, 0.5, SAMPLE_RATE as usize * 2, 512),
+            spec,
+        )
+        .into_matching_deck(|m| *m == "track_c");
+        assert!(matched_none.is_none());
     }
 
     #[test]

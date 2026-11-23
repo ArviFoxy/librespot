@@ -3,12 +3,11 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use data_encoding::{BASE64, BASE64_NOPAD, BASE64URL, BASE64URL_NOPAD};
 use protobuf::Message;
-use tokio::sync::Mutex;
 
 use crate::{
     core::{Session, SpotifyId, SpotifyUri},
@@ -80,6 +79,17 @@ pub struct TrackMixMetadata {
     pub automix_style: Option<AutomixStyle>,
 }
 
+/// Tri-state Mix mode signal extracted from Connect `modes`, context metadata, and track metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMixSignal {
+    /// Context/session explicitly enables Mix transitions.
+    Enabled,
+    /// User/session explicitly toggled Mix OFF (must override playlist `MIX_STATE.is_mixed` in Auto mode).
+    Disabled,
+    /// No explicit signal in Connect state; consult playlist `MIX_STATE`.
+    Unspecified,
+}
+
 /// Request snapshot captured from `ConnectState` to resolve the upcoming `(current -> next)` transition.
 #[derive(Debug, Clone)]
 pub struct TransitionResolveRequest {
@@ -87,8 +97,8 @@ pub struct TransitionResolveRequest {
     pub generation: u64,
     /// Active context URI (e.g. `spotify:playlist:...`).
     pub context_uri: String,
-    /// Whether `ConnectState` modes or context metadata already signal Mix ON.
-    pub context_signals_mixed: bool,
+    /// Whether `ConnectState` modes or context metadata signal Mix ON, OFF, or unspecified.
+    pub context_mix_signal: ContextMixSignal,
     /// Outgoing track URI.
     pub current_track_id: SpotifyUri,
     /// Outgoing track playlist row UID (when available).
@@ -120,29 +130,59 @@ pub struct TransitionResolveResult {
     pub spec: Option<TransitionSpec>,
 }
 
-/// Check whether Connect state `modes` or context metadata explicitly enable Mix mode.
-pub fn context_signals_mixed(
+/// Classify whether Connect state `modes`, context metadata, or track metadata explicitly enable
+/// or disable Mix mode. Session `modes` takes highest precedence so turning Mix OFF overrides
+/// static playlist `MIX_STATE.is_mixed` or previously transferred `audio.fade_*` metadata.
+pub fn classify_context_mix_signal(
     modes: Option<&HashMap<String, String>>,
     context_metadata: Option<&HashMap<String, String>>,
     current_track: Option<&ProvidedTrack>,
     next_track: Option<&ProvidedTrack>,
-) -> bool {
-    let map_is_mixed = |m: &HashMap<String, String>| -> bool {
-        m.get("automix.mode").is_some_and(|v| {
-            let l = v.to_ascii_lowercase();
-            l == "mixed" || l == "on" || l == "true" || l == "auto"
-        }) || m.get("mix").is_some_and(|v| {
-            let l = v.to_ascii_lowercase();
-            l == "on" || l == "true" || l == "mixed"
-        }) || m
-            .get("is_mixed")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            || m.get("mixer_enabled")
-                .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
+) -> ContextMixSignal {
+    let classify_map = |m: &HashMap<String, String>| -> ContextMixSignal {
+        if let Some(v) = m.get("automix.mode") {
+            let l = v.trim().to_ascii_lowercase();
+            if matches!(l.as_str(), "mixed" | "on" | "true" | "auto") {
+                return ContextMixSignal::Enabled;
+            }
+            if matches!(l.as_str(), "off" | "none" | "disabled" | "false") {
+                return ContextMixSignal::Disabled;
+            }
+        }
+        if let Some(v) = m.get("mix") {
+            let l = v.trim().to_ascii_lowercase();
+            if matches!(l.as_str(), "on" | "true" | "mixed") {
+                return ContextMixSignal::Enabled;
+            }
+            if matches!(l.as_str(), "off" | "false" | "disabled" | "none") {
+                return ContextMixSignal::Disabled;
+            }
+        }
+        for key in ["is_mixed", "mixer_enabled"] {
+            if let Some(v) = m.get(key) {
+                let l = v.trim().to_ascii_lowercase();
+                if l == "true" || l == "1" {
+                    return ContextMixSignal::Enabled;
+                }
+                if l == "false" || l == "0" {
+                    return ContextMixSignal::Disabled;
+                }
+            }
+        }
+        ContextMixSignal::Unspecified
     };
 
-    if modes.is_some_and(map_is_mixed) || context_metadata.is_some_and(map_is_mixed) {
-        return true;
+    if let Some(m) = modes {
+        let sig = classify_map(m);
+        if sig != ContextMixSignal::Unspecified {
+            return sig;
+        }
+    }
+    if let Some(m) = context_metadata {
+        let sig = classify_map(m);
+        if sig != ContextMixSignal::Unspecified {
+            return sig;
+        }
     }
 
     let has_track_mix_data = |t: &ProvidedTrack| {
@@ -156,7 +196,11 @@ pub fn context_signals_mixed(
                 .get("audio.fade_in_start_time")
                 .is_some_and(|v| !v.is_empty())
     };
-    current_track.is_some_and(has_track_mix_data) || next_track.is_some_and(has_track_mix_data)
+    if current_track.is_some_and(has_track_mix_data) || next_track.is_some_and(has_track_mix_data) {
+        ContextMixSignal::Enabled
+    } else {
+        ContextMixSignal::Unspecified
+    }
 }
 
 /// Decode a base64-encoded `spotify.automix.proto.Transition` (`transition_recipe`).
@@ -1146,9 +1190,15 @@ impl TransitionResolver {
         &self.config
     }
 
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, ResolverCache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Drop cached playlist mix state and user-made recipes after a live playlist modification.
-    pub async fn invalidate_playlist(&self, playlist_uri: &str) {
-        self.cache.lock().await.invalidate_playlist(playlist_uri);
+    pub fn invalidate_playlist(&self, playlist_uri: &str) {
+        self.lock_cache().invalidate_playlist(playlist_uri);
     }
 
     /// Resolve a [`TransitionSpec`] for `(current -> next)` in the background.
@@ -1267,18 +1317,24 @@ impl TransitionResolver {
         session: &Session,
         req: &TransitionResolveRequest,
     ) -> (bool, Vec<Transition>) {
+        if self.config.mode != MixMode::ForceAuto
+            && req.context_mix_signal == ContextMixSignal::Disabled
+        {
+            return (false, Vec::new());
+        }
+
+        let explicit_enabled = req.context_mix_signal == ContextMixSignal::Enabled;
         let is_playlist = req.context_uri.starts_with("spotify:playlist:");
         if !is_playlist {
-            let active = self.config.mode == MixMode::ForceAuto || req.context_signals_mixed;
+            let active = self.config.mode == MixMode::ForceAuto || explicit_enabled;
             return (active, Vec::new());
         }
 
         {
-            let guard = self.cache.lock().await;
+            let guard = self.lock_cache();
             if let Some(&cached_mixed) = guard.playlist_mixed.get(&req.context_uri) {
-                let active = self.config.mode == MixMode::ForceAuto
-                    || req.context_signals_mixed
-                    || cached_mixed;
+                let active =
+                    self.config.mode == MixMode::ForceAuto || explicit_enabled || cached_mixed;
                 let recipes = guard
                     .playlist_recipes
                     .get(&req.context_uri)
@@ -1289,7 +1345,7 @@ impl TransitionResolver {
         }
 
         // Query MIX_STATE on the playlist URI via extended-metadata.
-        let mut is_mixed = req.context_signals_mixed;
+        let mut is_mixed = explicit_enabled;
         if let Ok(entries) = session
             .spclient()
             .get_extended_metadata_entries(vec![(
@@ -1321,9 +1377,7 @@ impl TransitionResolver {
             }
         }
 
-        self.cache
-            .lock()
-            .await
+        self.lock_cache()
             .insert_playlist(req.context_uri.clone(), is_mixed, recipes.clone());
 
         let active = self.config.mode == MixMode::ForceAuto || is_mixed;
@@ -1337,7 +1391,7 @@ impl TransitionResolver {
         uri_b: &str,
     ) -> (TrackMixMetadata, TrackMixMetadata) {
         let (cached_a, cached_b) = {
-            let guard = self.cache.lock().await;
+            let guard = self.lock_cache();
             (
                 guard.tracks.get(uri_a).cloned(),
                 guard.tracks.get(uri_b).cloned(),
@@ -1379,7 +1433,7 @@ impl TransitionResolver {
                         let meta = parsed.entry(entry.entity_uri.clone()).or_default();
                         apply_extension_to_track_meta(meta, entry.kind, &entry.data);
                     }
-                    let mut guard = self.cache.lock().await;
+                    let mut guard = self.lock_cache();
                     for (u, m) in parsed {
                         guard.insert_track(u, m);
                     }
@@ -1390,7 +1444,7 @@ impl TransitionResolver {
             }
         }
 
-        let guard = self.cache.lock().await;
+        let guard = self.lock_cache();
         (
             guard.tracks.get(uri_a).cloned().unwrap_or_default(),
             guard.tracks.get(uri_b).cloned().unwrap_or_default(),
@@ -2178,6 +2232,50 @@ mod tests {
         assert!(
             best_start_b_sec <= 20.0,
             "expected intro best_fade_in_cuepoint (~16 s), got start_b_sec={best_start_b_sec}"
+        );
+    }
+
+    #[test]
+    fn classify_context_mix_signal_respects_explicit_modes_off_over_track_metadata() {
+        let mut track_with_fade = ProvidedTrack::default();
+        track_with_fade.metadata.insert(
+            "audio.fade_out_start_time".to_string(),
+            "170444".to_string(),
+        );
+
+        // Track fade metadata enables mix when session modes are unspecified.
+        assert_eq!(
+            classify_context_mix_signal(None, None, Some(&track_with_fade), None),
+            ContextMixSignal::Enabled
+        );
+
+        // Explicit session mode OFF overrides track fade metadata and context metadata.
+        let mut modes_off = HashMap::new();
+        modes_off.insert("automix.mode".to_string(), "off".to_string());
+        let mut ctx_on = HashMap::new();
+        ctx_on.insert("is_mixed".to_string(), "true".to_string());
+        assert_eq!(
+            classify_context_mix_signal(
+                Some(&modes_off),
+                Some(&ctx_on),
+                Some(&track_with_fade),
+                None
+            ),
+            ContextMixSignal::Disabled
+        );
+
+        // Explicit session mode ON enables mix even without track metadata.
+        let mut modes_on = HashMap::new();
+        modes_on.insert("automix.mode".to_string(), "mixed".to_string());
+        assert_eq!(
+            classify_context_mix_signal(Some(&modes_on), None, None, None),
+            ContextMixSignal::Enabled
+        );
+
+        // No hints anywhere stays Unspecified so playlist MIX_STATE is consulted.
+        assert_eq!(
+            classify_context_mix_signal(None, None, None, None),
+            ContextMixSignal::Unspecified
         );
     }
 }
