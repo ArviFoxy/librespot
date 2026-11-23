@@ -372,6 +372,11 @@ impl TransitionProcessor {
                 < self.deck_b.stretcher.recommended_input_frames()
     }
 
+    /// Current exact source frame position in Deck A at the playback cursor.
+    pub fn deck_a_source_frame(&self) -> f64 {
+        self.deck_a.playback_source_frame()
+    }
+
     /// Current exact source frame position in Deck B at the playback cursor.
     pub fn deck_b_source_frame(&self) -> f64 {
         self.deck_b.playback_source_frame()

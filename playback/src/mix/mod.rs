@@ -7,11 +7,15 @@
 
 pub mod beat_clock;
 pub mod curve;
+pub(crate) mod driver;
 pub mod engine;
 pub mod filters;
 pub mod spec;
 pub mod stretch;
 
+pub(crate) use driver::{
+    ActiveTransition, ENTRY_GRACE_FRAMES, EntryPacketDecision, TransitionDeck, split_entry_packet,
+};
 pub use engine::TransitionProcessor;
 pub use spec::{
     AutomationCurve, AutomationCurves, BeatGrid, BeatMarker, CurvePoint, DeckCurves, EqTopology,

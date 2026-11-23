@@ -134,7 +134,10 @@ passthrough-decoder = ["librespot-playback/passthrough-decoder"]
 
 # mix-transitions: Enables real-time dual-deck DJ transition processing (beatmatched
 # time-stretching, 3-band EQ, modulated filter sweeps, and automation curves) for Spotify Mix.
-mix-transitions = ["librespot-playback/mix-transitions"]
+mix-transitions = [
+    "librespot-playback/mix-transitions",
+    "librespot-connect/mix-transitions",
+]
 
 [lib]
 name = "librespot"

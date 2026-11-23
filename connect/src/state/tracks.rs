@@ -373,6 +373,26 @@ impl<'ct> ConnectState {
         SpotifyUri::from_uri(next).ok()
     }
 
+    /// Atomically commit a dual-deck transition to `incoming_track_id` without issuing
+    /// a redundant `Player::load`.
+    ///
+    /// Returns `Ok(true)` if `ConnectState` now points at `incoming_track_id` (either via
+    /// repeat-track staying on the same track or by advancing once when `preview_next_track()`
+    /// matches), and `Ok(false)` if the queue changed mid-overlap so the playlist is never
+    /// accidentally drained.
+    #[cfg(feature = "mix-transitions")]
+    pub fn commit_transition_to(&mut self, incoming_track_id: &SpotifyUri) -> Result<bool, Error> {
+        let incoming_uri = incoming_track_id.to_uri();
+        if self.repeat_track() && self.current_track(|t| t.uri == incoming_uri) {
+            return Ok(true);
+        }
+        if self.preview_next_track().as_ref() == Some(incoming_track_id) {
+            self.next_track()?;
+            return Ok(self.current_track(|t| t.uri == incoming_uri));
+        }
+        Ok(false)
+    }
+
     pub fn has_next_tracks(&self, min: Option<usize>) -> bool {
         if let Some(min) = min {
             self.next_tracks().len() >= min
@@ -446,5 +466,87 @@ impl<'ct> ConnectState {
             self.update_queue_revision();
         }
         self.update_restrictions();
+    }
+}
+
+#[cfg(all(test, feature = "mix-transitions"))]
+mod tests {
+    use super::*;
+    use crate::{
+        protocol::{
+            connect::Device,
+            player::{ContextIndex, PlayerState},
+        },
+        shuffle_vec::ShuffleVec,
+        state::context::StateContext,
+    };
+    use std::collections::HashMap;
+
+    fn make_track(uri: &str, uid: &str, idx: usize) -> ProvidedTrack {
+        let mut t = ProvidedTrack {
+            uri: uri.to_string(),
+            uid: uid.to_string(),
+            ..Default::default()
+        };
+        t.set_provider(Provider::Context);
+        t.set_context_index(idx);
+        t
+    }
+
+    #[test]
+    fn commit_transition_to_advances_once_respects_repeat_and_never_drains_on_mismatch() {
+        let uri_a = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
+        let uri_b = "spotify:track:0VjIjW4GlUZAMYd2vXMi3b";
+        let uri_c = "spotify:track:11dFghVXANMlKmJXsNCbNl";
+        let uri_d = "spotify:track:7qiZfU4dY1lWllzX7mPBI3";
+
+        let tracks = vec![
+            make_track(uri_a, "u1", 0),
+            make_track(uri_b, "u2", 1),
+            make_track(uri_c, "u3", 2),
+        ];
+
+        let mut state = ConnectState::default();
+        state.request.device = MessageField::some(Device {
+            player_state: MessageField::some(PlayerState::new()),
+            ..Default::default()
+        });
+        state.context = Some(StateContext {
+            tracks: ShuffleVec::from(tracks.clone()),
+            metadata: HashMap::new(),
+            restrictions: None,
+            index: ContextIndex {
+                page: 0,
+                track: 3,
+                ..Default::default()
+            },
+        });
+        state.set_track(tracks[0].clone());
+        state
+            .next_tracks_mut()
+            .extend([tracks[1].clone(), tracks[2].clone()]);
+
+        // Mismatched track must NOT advance or drain the playlist.
+        let id_d = SpotifyUri::from_uri(uri_d).unwrap();
+        assert!(!state.commit_transition_to(&id_d).unwrap());
+        assert_eq!(state.current_track(|t| t.uri.clone()), uri_a);
+        assert_eq!(state.next_tracks().len(), 2);
+
+        // Repeat-track on track A keeps track A active without popping track B.
+        state.set_repeat_track(true);
+        let id_a = SpotifyUri::from_uri(uri_a).unwrap();
+        assert!(state.commit_transition_to(&id_a).unwrap());
+        assert_eq!(state.current_track(|t| t.uri.clone()), uri_a);
+        assert_eq!(state.next_tracks().len(), 2);
+        state.set_repeat_track(false);
+
+        // Matching next track B advances atomically from A -> B, moving A to prev and keeping C next.
+        let id_b = SpotifyUri::from_uri(uri_b).unwrap();
+        assert!(state.commit_transition_to(&id_b).unwrap());
+        assert_eq!(state.current_track(|t| t.uri.clone()), uri_b);
+        assert_eq!(state.prev_tracks().len(), 1);
+        assert_eq!(state.prev_tracks()[0].uri, uri_a);
+        assert_eq!(state.next_tracks().len(), 1);
+        assert_eq!(state.next_tracks()[0].uri, uri_c);
     }
 }

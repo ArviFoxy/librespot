@@ -1,3 +1,5 @@
+#[cfg(feature = "mix-transitions")]
+use std::collections::VecDeque;
 use std::{
     collections::HashMap,
     fmt, fs,
@@ -19,6 +21,12 @@ use std::{
 
 #[cfg(feature = "passthrough-decoder")]
 use crate::decoder::PassthroughDecoder;
+#[cfg(feature = "mix-transitions")]
+use crate::mix::{
+    ActiveTransition, EntryPacketDecision, TransitionDeck, TransitionSpec, split_entry_packet,
+};
+#[cfg(feature = "mix-transitions")]
+use crate::{NUM_CHANNELS, SAMPLE_RATE};
 use crate::{
     audio::{AudioDecrypt, AudioFetchParams, AudioFile, StreamLoaderController},
     audio_backend::Sink,
@@ -205,6 +213,9 @@ struct PlayerInternal {
 
     master_limiter: MasterLimiter,
 
+    #[cfg(feature = "mix-transitions")]
+    scheduled_transition: Option<ScheduledTransition>,
+
     auto_normalise_as_album: bool,
 
     player_id: usize,
@@ -261,6 +272,13 @@ enum PlayerCommand {
         next_tracks: Vec<QueueTrack>,
         prev_tracks: Vec<QueueTrack>,
     },
+    #[cfg(feature = "mix-transitions")]
+    ScheduleTransition {
+        next_track_id: SpotifyUri,
+        spec: Box<TransitionSpec>,
+    },
+    #[cfg(feature = "mix-transitions")]
+    CancelTransition,
 }
 
 /// Represents a track in the queue with its URI and provider.
@@ -385,6 +403,22 @@ pub enum PlayerEvent {
         next_tracks: Vec<QueueTrack>,
         prev_tracks: Vec<QueueTrack>,
     },
+    /// Fired when a scheduled dual-deck DJ transition begins overlapping outgoing and incoming tracks.
+    #[cfg(feature = "mix-transitions")]
+    TransitionStarted {
+        outgoing_play_request_id: u64,
+        outgoing_track_id: SpotifyUri,
+        incoming_track_id: SpotifyUri,
+    },
+    /// Fired once when the active transition crosses `handoff_fraction` (or finishes), committing
+    /// the incoming track as active without issuing a redundant `Player::load`.
+    #[cfg(feature = "mix-transitions")]
+    TransitionCommit {
+        outgoing_play_request_id: u64,
+        incoming_track_id: SpotifyUri,
+        incoming_play_request_id: u64,
+        incoming_position_ms: u32,
+    },
 }
 
 impl PlayerEvent {
@@ -418,6 +452,15 @@ impl PlayerEvent {
             | Seeked {
                 play_request_id, ..
             } => Some(*play_request_id),
+            #[cfg(feature = "mix-transitions")]
+            TransitionStarted {
+                outgoing_play_request_id,
+                ..
+            }
+            | TransitionCommit {
+                outgoing_play_request_id,
+                ..
+            } => Some(*outgoing_play_request_id),
             _ => None,
         }
     }
@@ -637,6 +680,9 @@ impl Player {
 
                 master_limiter,
 
+                #[cfg(feature = "mix-transitions")]
+                scheduled_transition: None,
+
                 auto_normalise_as_album: false,
 
                 player_id,
@@ -685,6 +731,19 @@ impl Player {
 
     pub fn preload(&self, track_id: SpotifyUri) {
         self.command(PlayerCommand::Preload { track_id });
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    pub fn schedule_transition(&self, next_track_id: SpotifyUri, spec: TransitionSpec) {
+        self.command(PlayerCommand::ScheduleTransition {
+            next_track_id,
+            spec: Box::new(spec),
+        });
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    pub fn cancel_transition(&self) {
+        self.command(PlayerCommand::CancelTransition);
     }
 
     pub fn play(&self) {
@@ -821,14 +880,36 @@ struct PlayerLoadedTrackData {
     is_explicit: bool,
 }
 
+#[cfg(feature = "mix-transitions")]
+struct ScheduledTransition {
+    next_track_id: SpotifyUri,
+    spec: TransitionSpec,
+}
+
+#[cfg(feature = "mix-transitions")]
+struct TransitionDeckMeta {
+    track_id: SpotifyUri,
+    play_request_id: u64,
+    audio_item: AudioItem,
+    normalisation_data: NormalisationData,
+    stream_loader_controller: StreamLoaderController,
+    bytes_per_second: usize,
+    duration_ms: u32,
+    is_explicit: bool,
+}
+
 enum PlayerPreload {
     None,
     Loading {
         track_id: SpotifyUri,
+        #[cfg(feature = "mix-transitions")]
+        start_frame: Option<u64>,
         loader: Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send>>,
     },
     Ready {
         track_id: SpotifyUri,
+        #[cfg(feature = "mix-transitions")]
+        start_frame: Option<u64>,
         loaded_track: Box<PlayerLoadedTrackData>,
     },
 }
@@ -856,6 +937,8 @@ enum PlayerState {
         stream_position_ms: u32,
         suggested_to_preload_next_track: bool,
         is_explicit: bool,
+        #[cfg(feature = "mix-transitions")]
+        pending_normalized_pcm: VecDeque<f64>,
     },
     Playing {
         track_id: SpotifyUri,
@@ -871,7 +954,11 @@ enum PlayerState {
         reported_nominal_start_time: Option<Instant>,
         suggested_to_preload_next_track: bool,
         is_explicit: bool,
+        #[cfg(feature = "mix-transitions")]
+        pending_normalized_pcm: VecDeque<f64>,
     },
+    #[cfg(feature = "mix-transitions")]
+    Transitioning(Box<ActiveTransition<TransitionDeckMeta>>),
     EndOfTrack {
         track_id: SpotifyUri,
         play_request_id: u64,
@@ -886,6 +973,8 @@ impl PlayerState {
         match *self {
             Stopped | EndOfTrack { .. } | Paused { .. } | Loading { .. } => false,
             Playing { .. } => true,
+            #[cfg(feature = "mix-transitions")]
+            Transitioning(ref active) => !active.is_paused(),
             Invalid => {
                 error!("PlayerState::is_playing in invalid state");
                 exit(1);
@@ -909,6 +998,8 @@ impl PlayerState {
         use self::PlayerState::*;
         match *self {
             Stopped | EndOfTrack { .. } | Loading { .. } => None,
+            #[cfg(feature = "mix-transitions")]
+            Transitioning(..) => None,
             Paused {
                 ref mut decoder, ..
             }
@@ -978,6 +1069,8 @@ impl PlayerState {
                 stream_position_ms,
                 suggested_to_preload_next_track,
                 is_explicit,
+                #[cfg(feature = "mix-transitions")]
+                pending_normalized_pcm,
             } => {
                 *self = Playing {
                     track_id,
@@ -994,6 +1087,8 @@ impl PlayerState {
                         .checked_sub(Duration::from_millis(stream_position_ms as u64)),
                     suggested_to_preload_next_track,
                     is_explicit,
+                    #[cfg(feature = "mix-transitions")]
+                    pending_normalized_pcm,
                 };
             }
             _ => {
@@ -1020,6 +1115,8 @@ impl PlayerState {
                 stream_position_ms,
                 suggested_to_preload_next_track,
                 is_explicit,
+                #[cfg(feature = "mix-transitions")]
+                pending_normalized_pcm,
                 ..
             } => {
                 *self = Paused {
@@ -1035,6 +1132,8 @@ impl PlayerState {
                     stream_position_ms,
                     suggested_to_preload_next_track,
                     is_explicit,
+                    #[cfg(feature = "mix-transitions")]
+                    pending_normalized_pcm,
                 };
             }
             _ => {
@@ -1107,12 +1206,27 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        #[cfg(feature = "mix-transitions")] exact_frame: Option<u64>,
     ) -> Option<PlayerLoadedTrackData> {
         match track_uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
-                self.load_remote_track(track_uri, position_ms).await
+                self.load_remote_track(
+                    track_uri,
+                    position_ms,
+                    #[cfg(feature = "mix-transitions")]
+                    exact_frame,
+                )
+                .await
             }
-            SpotifyUri::Local { .. } => self.load_local_track(track_uri, position_ms).await,
+            SpotifyUri::Local { .. } => {
+                self.load_local_track(
+                    track_uri,
+                    position_ms,
+                    #[cfg(feature = "mix-transitions")]
+                    exact_frame,
+                )
+                .await
+            }
             _ => {
                 error!("Cannot handle load of track with URI: <{track_uri}>",);
                 None
@@ -1124,6 +1238,7 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        #[cfg(feature = "mix-transitions")] exact_frame: Option<u64>,
     ) -> Option<PlayerLoadedTrackData> {
         let track_id: SpotifyId = match (&track_uri).try_into() {
             Ok(id) => id,
@@ -1331,6 +1446,35 @@ impl PlayerTrackLoader {
             // the cursor may have been moved by parsing normalisation data. This may not
             // matter for playback (but won't hurt either), but may be useful for the
             // passthrough decoder.
+            #[cfg(feature = "mix-transitions")]
+            let stream_position_ms = if let Some(target_frame) = exact_frame {
+                let max_frames = (u64::from(duration_ms) * u64::from(SAMPLE_RATE)) / 1000;
+                let clamped = if max_frames > 0 {
+                    target_frame.min(max_frames)
+                } else {
+                    target_frame
+                };
+                match decoder.seek_exact(clamped) {
+                    Ok(actual_frame) => ((actual_frame * 1000) / u64::from(SAMPLE_RATE)) as u32,
+                    Err(e) => {
+                        error!(
+                            "PlayerTrackLoader::load_track error exact-seeking to frame {clamped}: {e}"
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                match decoder.seek(position_ms) {
+                    Ok(new_position_ms) => new_position_ms,
+                    Err(e) => {
+                        error!(
+                            "PlayerTrackLoader::load_track error seeking to starting position {position_ms}: {e}"
+                        );
+                        return None;
+                    }
+                }
+            };
+            #[cfg(not(feature = "mix-transitions"))]
             let stream_position_ms = match decoder.seek(position_ms) {
                 Ok(new_position_ms) => new_position_ms,
                 Err(e) => {
@@ -1370,6 +1514,7 @@ impl PlayerTrackLoader {
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
+        #[cfg(feature = "mix-transitions")] exact_frame: Option<u64>,
     ) -> Option<PlayerLoadedTrackData> {
         info!("Loading local file with Spotify URI <{}>", track_uri);
 
@@ -1414,6 +1559,29 @@ impl PlayerTrackLoader {
 
         let local_file_metadata = decoder.local_file_metadata().unwrap_or_default();
 
+        #[cfg(feature = "mix-transitions")]
+        let stream_position_ms = if let Some(target_frame) = exact_frame {
+            match decoder.seek_exact(target_frame) {
+                Ok(actual_frame) => ((actual_frame * 1000) / u64::from(SAMPLE_RATE)) as u32,
+                Err(e) => {
+                    error!(
+                        "PlayerTrackLoader::load_local_track error exact-seeking to frame {target_frame}: {e}"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            match decoder.seek(position_ms) {
+                Ok(new_position_ms) => new_position_ms,
+                Err(e) => {
+                    error!(
+                        "PlayerTrackLoader::load_local_track error seeking to starting position {position_ms}: {e}"
+                    );
+                    return None;
+                }
+            }
+        };
+        #[cfg(not(feature = "mix-transitions"))]
         let stream_position_ms = match decoder.seek(position_ms) {
             Ok(new_position_ms) => new_position_ms,
             Err(e) => {
@@ -1540,6 +1708,8 @@ impl Future for PlayerInternal {
             if let PlayerPreload::Loading {
                 ref mut loader,
                 ref track_id,
+                #[cfg(feature = "mix-transitions")]
+                start_frame,
             } = self.preload
             {
                 let track_id = track_id.clone();
@@ -1550,12 +1720,22 @@ impl Future for PlayerInternal {
                         });
                         self.preload = PlayerPreload::Ready {
                             track_id,
+                            #[cfg(feature = "mix-transitions")]
+                            start_frame,
                             loaded_track: Box::new(loaded_track),
                         };
                     }
                     Poll::Ready(Err(_)) => {
                         debug!("Unable to preload {track_id:?}");
                         self.preload = PlayerPreload::None;
+                        #[cfg(feature = "mix-transitions")]
+                        if self
+                            .scheduled_transition
+                            .as_ref()
+                            .is_some_and(|s| s.next_track_id == track_id)
+                        {
+                            self.scheduled_transition = None;
+                        }
                         // Let Spirc know that the track was unavailable.
                         if let PlayerState::Playing {
                             play_request_id, ..
@@ -1577,6 +1757,17 @@ impl Future for PlayerInternal {
             if self.state.is_playing() {
                 self.ensure_sink_running();
 
+                #[cfg(feature = "mix-transitions")]
+                if matches!(self.state, PlayerState::Transitioning(_)) {
+                    self.step_active_transition();
+                    continue;
+                }
+
+                #[cfg(feature = "mix-transitions")]
+                if self.drain_pending_normalized_pcm() {
+                    continue;
+                }
+
                 if let PlayerState::Playing {
                     ref track_id,
                     play_request_id,
@@ -1590,6 +1781,9 @@ impl Future for PlayerInternal {
                     let track_id = track_id.clone();
                     match decoder.next_packet() {
                         Ok(result) => {
+                            #[cfg(feature = "mix-transitions")]
+                            let decoder_end_frame = decoder.position_frames();
+
                             if let Some((ref packet_position, ref packet)) = result {
                                 let new_stream_position_ms = packet_position.position_ms;
                                 let expected_position_ms = std::mem::replace(
@@ -1682,6 +1876,18 @@ impl Future for PlayerInternal {
                                 }
                             }
 
+                            #[cfg(feature = "mix-transitions")]
+                            if !passthrough
+                                && self.scheduled_transition.is_some()
+                                && self.maybe_enter_scheduled_transition(
+                                    &result,
+                                    decoder_end_frame,
+                                    normalisation_factor,
+                                )
+                            {
+                                continue;
+                            }
+
                             self.handle_packet(result, normalisation_factor);
                         }
                         Err(e) => {
@@ -1699,6 +1905,9 @@ impl Future for PlayerInternal {
                     exit(1);
                 };
             }
+
+            #[cfg(feature = "mix-transitions")]
+            self.maybe_preload_scheduled_transition();
 
             if let PlayerState::Playing {
                 ref track_id,
@@ -1792,6 +2001,26 @@ impl PlayerInternal {
     }
 
     fn handle_player_stop(&mut self) {
+        #[cfg(feature = "mix-transitions")]
+        {
+            self.scheduled_transition = None;
+            if matches!(self.state, PlayerState::Transitioning(_)) {
+                self.drain_active_transition_abort_fade();
+                if let PlayerState::Transitioning(ref active) = self.state {
+                    let meta = active.reported_meta();
+                    let track_id = meta.track_id.clone();
+                    let play_request_id = meta.play_request_id;
+                    self.ensure_sink_stopped(false);
+                    self.send_event(PlayerEvent::Stopped {
+                        track_id,
+                        play_request_id,
+                    });
+                    self.state = PlayerState::Stopped;
+                    return;
+                }
+            }
+        }
+
         match self.state {
             PlayerState::Playing {
                 ref track_id,
@@ -1823,6 +2052,8 @@ impl PlayerInternal {
                 self.state = PlayerState::Stopped;
             }
             PlayerState::Stopped => (),
+            #[cfg(feature = "mix-transitions")]
+            PlayerState::Transitioning(_) => (),
             PlayerState::Invalid => {
                 error!("PlayerInternal::handle_player_stop in invalid state");
                 exit(1);
@@ -1845,6 +2076,20 @@ impl PlayerInternal {
                     track_id,
                     play_request_id,
                     position_ms: stream_position_ms,
+                });
+                self.ensure_sink_running();
+            }
+            #[cfg(feature = "mix-transitions")]
+            PlayerState::Transitioning(ref mut active) if active.is_paused() => {
+                active.resume();
+                let meta = active.reported_meta();
+                let track_id = meta.track_id.clone();
+                let play_request_id = meta.play_request_id;
+                let position_ms = active.reported_position_ms();
+                self.send_event(PlayerEvent::Playing {
+                    track_id,
+                    play_request_id,
+                    position_ms,
                 });
                 self.ensure_sink_running();
             }
@@ -1877,6 +2122,24 @@ impl PlayerInternal {
                     play_request_id,
                     position_ms: stream_position_ms,
                 });
+            }
+            #[cfg(feature = "mix-transitions")]
+            PlayerState::Transitioning(ref mut active) => {
+                if active.is_paused() {
+                    self.ensure_sink_stopped(false);
+                } else {
+                    active.pause();
+                    let meta = active.reported_meta();
+                    let track_id = meta.track_id.clone();
+                    let play_request_id = meta.play_request_id;
+                    let position_ms = active.reported_position_ms();
+                    self.ensure_sink_stopped(false);
+                    self.send_event(PlayerEvent::Paused {
+                        track_id,
+                        play_request_id,
+                        position_ms,
+                    });
+                }
             }
             PlayerState::Loading {
                 ref mut start_playback,
@@ -1933,6 +2196,18 @@ impl PlayerInternal {
         }
     }
 
+    fn compute_normalisation_factor(&self, data: NormalisationData) -> f64 {
+        let mut config = self.config.clone();
+        if config.normalisation_type == NormalisationType::Auto {
+            if self.auto_normalise_as_album {
+                config.normalisation_type = NormalisationType::Album;
+            } else {
+                config.normalisation_type = NormalisationType::Track;
+            }
+        }
+        NormalisationData::get_factor(&config, data)
+    }
+
     fn start_playback(
         &mut self,
         track_id: SpotifyUri,
@@ -1945,17 +2220,8 @@ impl PlayerInternal {
         self.send_event(PlayerEvent::TrackChanged { audio_item });
 
         let position_ms = loaded_track.stream_position_ms;
-
-        let mut config = self.config.clone();
-        if config.normalisation_type == NormalisationType::Auto {
-            if self.auto_normalise_as_album {
-                config.normalisation_type = NormalisationType::Album;
-            } else {
-                config.normalisation_type = NormalisationType::Track;
-            }
-        };
         let normalisation_factor =
-            NormalisationData::get_factor(&config, loaded_track.normalisation_data);
+            self.compute_normalisation_factor(loaded_track.normalisation_data);
 
         if start_playback {
             self.ensure_sink_running();
@@ -1980,6 +2246,8 @@ impl PlayerInternal {
                     .checked_sub(Duration::from_millis(position_ms as u64)),
                 suggested_to_preload_next_track: false,
                 is_explicit: loaded_track.is_explicit,
+                #[cfg(feature = "mix-transitions")]
+                pending_normalized_pcm: VecDeque::new(),
             };
         } else {
             self.ensure_sink_stopped(false);
@@ -1997,6 +2265,8 @@ impl PlayerInternal {
                 stream_position_ms: loaded_track.stream_position_ms,
                 suggested_to_preload_next_track: false,
                 is_explicit: loaded_track.is_explicit,
+                #[cfg(feature = "mix-transitions")]
+                pending_normalized_pcm: VecDeque::new(),
             };
 
             self.send_event(PlayerEvent::Paused {
@@ -2014,6 +2284,15 @@ impl PlayerInternal {
         play: bool,
         position_ms: u32,
     ) -> PlayerResult {
+        #[cfg(feature = "mix-transitions")]
+        {
+            self.scheduled_transition = None;
+            if matches!(self.state, PlayerState::Transitioning(_)) {
+                self.drain_active_transition_abort_fade();
+                self.state = PlayerState::Stopped;
+            }
+        }
+
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
@@ -2156,10 +2435,18 @@ impl PlayerInternal {
                 let preload = std::mem::replace(&mut self.preload, PlayerPreload::None);
                 if let PlayerPreload::Ready {
                     track_id,
+                    #[cfg(feature = "mix-transitions")]
+                    start_frame,
                     mut loaded_track,
                 } = preload
                 {
-                    if position_ms != loaded_track.stream_position_ms {
+                    #[cfg(feature = "mix-transitions")]
+                    let needs_reseek =
+                        position_ms != loaded_track.stream_position_ms || start_frame.is_some();
+                    #[cfg(not(feature = "mix-transitions"))]
+                    let needs_reseek = position_ms != loaded_track.stream_position_ms;
+
+                    if needs_reseek {
                         // This may be blocking
                         loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
                     }
@@ -2183,10 +2470,17 @@ impl PlayerInternal {
         // Try to extract a pending loader from the preloading mechanism
         let loader = if let PlayerPreload::Loading {
             track_id: loaded_track_id,
+            #[cfg(feature = "mix-transitions")]
+            start_frame,
             ..
         } = &self.preload
         {
-            if (track_id == *loaded_track_id) && (position_ms == 0) {
+            #[cfg(feature = "mix-transitions")]
+            let starts_at_zero = start_frame.is_none();
+            #[cfg(not(feature = "mix-transitions"))]
+            let starts_at_zero = true;
+
+            if (track_id == *loaded_track_id) && (position_ms == 0) && starts_at_zero {
                 let mut preload = PlayerPreload::None;
                 std::mem::swap(&mut preload, &mut self.preload);
                 if let PlayerPreload::Loading { loader, .. } = preload {
@@ -2204,8 +2498,14 @@ impl PlayerInternal {
         self.preload = PlayerPreload::None;
 
         // If we don't have a loader yet, create one from scratch.
-        let loader =
-            loader.unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms)));
+        let loader = loader.unwrap_or_else(|| {
+            Box::pin(self.load_track(
+                track_id.clone(),
+                position_ms,
+                #[cfg(feature = "mix-transitions")]
+                None,
+            ))
+        });
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
@@ -2261,15 +2561,69 @@ impl PlayerInternal {
 
         // schedule the preload of the current track if desired.
         if preload_track {
-            let loader = self.load_track(track_id.clone(), 0);
+            let loader = self.load_track(
+                track_id.clone(),
+                0,
+                #[cfg(feature = "mix-transitions")]
+                None,
+            );
             self.preload = PlayerPreload::Loading {
                 track_id,
+                #[cfg(feature = "mix-transitions")]
+                start_frame: None,
                 loader: Box::pin(loader),
             }
         }
     }
 
     fn handle_command_seek(&mut self, position_ms: u32) -> PlayerResult {
+        #[cfg(feature = "mix-transitions")]
+        if matches!(self.state, PlayerState::Transitioning(_)) {
+            self.drain_active_transition_abort_fade();
+            if let PlayerState::Transitioning(active) =
+                mem::replace(&mut self.state, PlayerState::Invalid)
+            {
+                let was_paused = active.is_paused();
+                let deck = active.into_active_deck_for_seek();
+                let meta = deck.meta;
+                self.state = if was_paused {
+                    PlayerState::Paused {
+                        track_id: meta.track_id,
+                        play_request_id: meta.play_request_id,
+                        decoder: deck.decoder,
+                        audio_item: meta.audio_item,
+                        normalisation_data: meta.normalisation_data,
+                        normalisation_factor: deck.normalisation_factor,
+                        stream_loader_controller: meta.stream_loader_controller,
+                        bytes_per_second: meta.bytes_per_second,
+                        duration_ms: meta.duration_ms,
+                        stream_position_ms: position_ms,
+                        suggested_to_preload_next_track: false,
+                        is_explicit: meta.is_explicit,
+                        pending_normalized_pcm: VecDeque::new(),
+                    }
+                } else {
+                    PlayerState::Playing {
+                        track_id: meta.track_id,
+                        play_request_id: meta.play_request_id,
+                        decoder: deck.decoder,
+                        audio_item: meta.audio_item,
+                        normalisation_data: meta.normalisation_data,
+                        normalisation_factor: deck.normalisation_factor,
+                        stream_loader_controller: meta.stream_loader_controller,
+                        bytes_per_second: meta.bytes_per_second,
+                        duration_ms: meta.duration_ms,
+                        stream_position_ms: position_ms,
+                        reported_nominal_start_time: Instant::now()
+                            .checked_sub(Duration::from_millis(position_ms as u64)),
+                        suggested_to_preload_next_track: false,
+                        is_explicit: meta.is_explicit,
+                        pending_normalized_pcm: VecDeque::new(),
+                    }
+                };
+            }
+        }
+
         // When we are still loading, the user may immediately ask to
         // seek to another position yet the decoder won't be ready for
         // that. In this case just restart the loading process but
@@ -2296,22 +2650,41 @@ impl PlayerInternal {
                         ref mut stream_position_ms,
                         ref track_id,
                         play_request_id,
+                        #[cfg(feature = "mix-transitions")]
+                        ref mut pending_normalized_pcm,
                         ..
                     }
                     | PlayerState::Paused {
                         ref mut stream_position_ms,
                         ref track_id,
                         play_request_id,
+                        #[cfg(feature = "mix-transitions")]
+                        ref mut pending_normalized_pcm,
                         ..
                     } = self.state
                     {
                         *stream_position_ms = new_position_ms;
+                        #[cfg(feature = "mix-transitions")]
+                        pending_normalized_pcm.clear();
 
                         self.send_event(PlayerEvent::Seeked {
                             play_request_id,
                             track_id: track_id.clone(),
                             position_ms: new_position_ms,
                         });
+                    }
+                    #[cfg(feature = "mix-transitions")]
+                    if let Some(ref sched) = self.scheduled_transition {
+                        let seek_frame =
+                            (u64::from(new_position_ms) * u64::from(SAMPLE_RATE)) / 1000;
+                        if seek_frame
+                            > sched
+                                .spec
+                                .start_a_frame
+                                .saturating_add(crate::mix::ENTRY_GRACE_FRAMES)
+                        {
+                            self.scheduled_transition = None;
+                        }
                     }
                 }
                 Err(e) => error!("PlayerInternal::handle_command_seek error: {e}"),
@@ -2345,6 +2718,17 @@ impl PlayerInternal {
             } => self.handle_command_load(track_id, None, play, position_ms)?,
 
             PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
+
+            #[cfg(feature = "mix-transitions")]
+            PlayerCommand::ScheduleTransition {
+                next_track_id,
+                spec,
+            } => self.handle_command_schedule_transition(next_track_id, *spec),
+
+            #[cfg(feature = "mix-transitions")]
+            PlayerCommand::CancelTransition => {
+                self.scheduled_transition = None;
+            }
 
             PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
 
@@ -2465,6 +2849,7 @@ impl PlayerInternal {
         &mut self,
         spotify_uri: SpotifyUri,
         position_ms: u32,
+        #[cfg(feature = "mix-transitions")] exact_frame: Option<u64>,
     ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
@@ -2484,7 +2869,12 @@ impl PlayerInternal {
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+            let data = handle.block_on(loader.load_track(
+                spotify_uri,
+                position_ms,
+                #[cfg(feature = "mix-transitions")]
+                exact_frame,
+            ));
             if let Some(data) = data {
                 let _ = result_tx.send(data);
             }
@@ -2497,6 +2887,398 @@ impl PlayerInternal {
         load_handles.insert(load_handle.thread().id(), load_handle);
 
         result_rx.map_err(|_| ())
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn handle_command_schedule_transition(
+        &mut self,
+        next_track_id: SpotifyUri,
+        spec: TransitionSpec,
+    ) {
+        if self.config.passthrough {
+            debug!("Ignoring scheduled transition because passthrough mode is enabled");
+            return;
+        }
+        debug!(
+            "Scheduled mix transition to <{next_track_id}> at frame {} -> {}",
+            spec.start_a_frame, spec.start_b_frame
+        );
+        self.scheduled_transition = Some(ScheduledTransition {
+            next_track_id,
+            spec,
+        });
+        self.maybe_preload_scheduled_transition();
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn maybe_preload_scheduled_transition(&mut self) {
+        let Some(ref sched) = self.scheduled_transition else {
+            return;
+        };
+        let (stream_position_ms, duration_ms) = match &self.state {
+            PlayerState::Playing {
+                stream_position_ms,
+                duration_ms,
+                ..
+            }
+            | PlayerState::Paused {
+                stream_position_ms,
+                duration_ms,
+                ..
+            } => (*stream_position_ms, *duration_ms),
+            _ => return,
+        };
+
+        let start_a_ms = ((sched.spec.start_a_frame * 1000) / u64::from(SAMPLE_RATE))
+            .min(u64::from(duration_ms)) as i64;
+        if start_a_ms - i64::from(stream_position_ms)
+            >= i64::from(PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS)
+        {
+            return;
+        }
+
+        let target_id = sched.next_track_id.clone();
+        let target_frame = sched.spec.start_b_frame;
+
+        let already_matching = match &self.preload {
+            PlayerPreload::Loading {
+                track_id,
+                start_frame,
+                ..
+            }
+            | PlayerPreload::Ready {
+                track_id,
+                start_frame,
+                ..
+            } => {
+                *track_id == target_id
+                    && (*start_frame == Some(target_frame)
+                        || (target_frame == 0 && start_frame.is_none()))
+            }
+            PlayerPreload::None => false,
+        };
+        if already_matching {
+            return;
+        }
+
+        let loader = self.load_track(target_id.clone(), 0, Some(target_frame));
+        self.preload = PlayerPreload::Loading {
+            track_id: target_id,
+            start_frame: Some(target_frame),
+            loader: Box::pin(loader),
+        };
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn drain_pending_normalized_pcm(&mut self) -> bool {
+        let channels = usize::from(NUM_CHANNELS);
+        let max_samples = 1024 * channels;
+
+        let chunk = if let PlayerState::Playing {
+            ref mut pending_normalized_pcm,
+            ref mut stream_position_ms,
+            ..
+        } = self.state
+        {
+            if pending_normalized_pcm.is_empty() {
+                return false;
+            }
+            let take = pending_normalized_pcm.len().min(max_samples);
+            let chunk: Vec<f64> = pending_normalized_pcm.drain(..take).collect();
+            let advance_ms = ((take / channels) as u64 * 1000 / u64::from(SAMPLE_RATE)) as u32;
+            *stream_position_ms = stream_position_ms.saturating_add(advance_ms);
+            chunk
+        } else {
+            return false;
+        };
+
+        let mut data = chunk;
+        let volume = self.volume_getter.attenuation_factor();
+        self.master_limiter
+            .process_post_mix(&mut data, &self.config, volume);
+        if let Err(e) = self
+            .sink
+            .write(AudioPacket::Samples(data), &mut self.converter)
+        {
+            error!("{e}");
+            self.handle_pause();
+        }
+        true
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn maybe_enter_scheduled_transition(
+        &mut self,
+        result: &Option<(AudioPacketPosition, AudioPacket)>,
+        decoder_end_frame: Option<u64>,
+        normalisation_factor: f64,
+    ) -> bool {
+        let Some((packet_position, AudioPacket::Samples(samples))) = result else {
+            return false;
+        };
+        let Some(ref sched) = self.scheduled_transition else {
+            return false;
+        };
+        let channels = usize::from(NUM_CHANNELS);
+        let pkt_frames = (samples.len() / channels) as u64;
+        let pkt_end_frame = decoder_end_frame.unwrap_or_else(|| {
+            ((u64::from(packet_position.position_ms) * u64::from(SAMPLE_RATE)) / 1000)
+                .saturating_add(pkt_frames)
+        });
+        let pkt_start_frame = pkt_end_frame.saturating_sub(pkt_frames);
+
+        let dry_prefix_samples = match split_entry_packet(
+            samples.len(),
+            pkt_start_frame,
+            sched.spec.start_a_frame,
+        ) {
+            EntryPacketDecision::BeforeEntry => return false,
+            EntryPacketDecision::PastGraceWindow => {
+                warn!(
+                    "Scheduled transition to <{}> missed entry window at frame {}; falling back to gapless EOF",
+                    sched.next_track_id, sched.spec.start_a_frame
+                );
+                self.scheduled_transition = None;
+                return false;
+            }
+            EntryPacketDecision::CrossesEntry { dry_prefix_samples } => dry_prefix_samples,
+            EntryPacketDecision::WithinGraceWindow => 0,
+        };
+
+        let preload_ready = matches!(
+            &self.preload,
+            PlayerPreload::Ready { track_id, .. } if *track_id == sched.next_track_id
+        );
+        if !preload_ready {
+            // Keep playing Deck A dry while preload finishes (still inside grace window).
+            return false;
+        }
+
+        let sched = self.scheduled_transition.take().unwrap();
+        let PlayerPreload::Ready {
+            track_id: incoming_track_id,
+            start_frame,
+            mut loaded_track,
+        } = mem::replace(&mut self.preload, PlayerPreload::None)
+        else {
+            return false;
+        };
+
+        if start_frame != Some(sched.spec.start_b_frame) {
+            if let Err(e) = loaded_track.decoder.seek_exact(sched.spec.start_b_frame) {
+                warn!(
+                    "Failed to exact-seek incoming track <{incoming_track_id}> to frame {} ({e}); falling back to gapless EOF",
+                    sched.spec.start_b_frame
+                );
+                self.preload = PlayerPreload::Ready {
+                    track_id: incoming_track_id,
+                    start_frame,
+                    loaded_track,
+                };
+                return false;
+            }
+        }
+
+        // Play the dry prefix of Deck A up to exact frame `start_a_frame`.
+        if dry_prefix_samples > 0 {
+            let mut prefix = samples[..dry_prefix_samples].to_vec();
+            let volume = self.volume_getter.attenuation_factor();
+            apply_track_normalisation(&mut prefix, &self.config, normalisation_factor);
+            self.master_limiter
+                .process_post_mix(&mut prefix, &self.config, volume);
+            if let Err(e) = self
+                .sink
+                .write(AudioPacket::Samples(prefix), &mut self.converter)
+            {
+                error!("{e}");
+                self.handle_pause();
+            }
+        }
+
+        let mut suffix = samples[dry_prefix_samples..].to_vec();
+        apply_track_normalisation(&mut suffix, &self.config, normalisation_factor);
+
+        let PlayerState::Playing {
+            track_id: outgoing_track_id,
+            play_request_id: outgoing_play_request_id,
+            decoder: outgoing_decoder,
+            audio_item: outgoing_audio_item,
+            normalisation_data: outgoing_norm_data,
+            normalisation_factor: outgoing_norm_factor,
+            stream_loader_controller: outgoing_slc,
+            bytes_per_second: outgoing_bps,
+            duration_ms: outgoing_duration_ms,
+            is_explicit: outgoing_is_explicit,
+            ..
+        } = mem::replace(&mut self.state, PlayerState::Invalid)
+        else {
+            error!("PlayerInternal::maybe_enter_scheduled_transition in non-playing state");
+            exit(1);
+        };
+
+        let incoming_play_request_id = self.play_request_id_generator.get();
+        let incoming_norm_factor =
+            self.compute_normalisation_factor(loaded_track.normalisation_data);
+
+        let outgoing_deck = TransitionDeck {
+            decoder: outgoing_decoder,
+            normalisation_factor: outgoing_norm_factor,
+            meta: TransitionDeckMeta {
+                track_id: outgoing_track_id.clone(),
+                play_request_id: outgoing_play_request_id,
+                audio_item: outgoing_audio_item,
+                normalisation_data: outgoing_norm_data,
+                stream_loader_controller: outgoing_slc,
+                bytes_per_second: outgoing_bps,
+                duration_ms: outgoing_duration_ms,
+                is_explicit: outgoing_is_explicit,
+            },
+        };
+        let incoming_deck = TransitionDeck {
+            decoder: loaded_track.decoder,
+            normalisation_factor: incoming_norm_factor,
+            meta: TransitionDeckMeta {
+                track_id: incoming_track_id.clone(),
+                play_request_id: incoming_play_request_id,
+                audio_item: loaded_track.audio_item,
+                normalisation_data: loaded_track.normalisation_data,
+                stream_loader_controller: loaded_track.stream_loader_controller,
+                bytes_per_second: loaded_track.bytes_per_second,
+                duration_ms: loaded_track.duration_ms,
+                is_explicit: loaded_track.is_explicit,
+            },
+        };
+
+        let active = ActiveTransition::new(outgoing_deck, incoming_deck, sched.spec, &suffix);
+        self.state = PlayerState::Transitioning(Box::new(active));
+        self.send_event(PlayerEvent::TransitionStarted {
+            outgoing_play_request_id,
+            outgoing_track_id,
+            incoming_track_id,
+        });
+        true
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn emit_transition_commit(&mut self, incoming_position_ms: u32) {
+        let PlayerState::Transitioning(ref active) = self.state else {
+            return;
+        };
+        let outgoing_play_request_id = active.outgoing_meta().play_request_id;
+        let incoming = active.incoming_meta();
+        let incoming_track_id = incoming.track_id.clone();
+        let incoming_play_request_id = incoming.play_request_id;
+        let incoming_audio_item = Box::new(incoming.audio_item.clone());
+
+        self.send_event(PlayerEvent::TransitionCommit {
+            outgoing_play_request_id,
+            incoming_track_id: incoming_track_id.clone(),
+            incoming_play_request_id,
+            incoming_position_ms,
+        });
+        self.send_event(PlayerEvent::PlayRequestIdChanged {
+            play_request_id: incoming_play_request_id,
+        });
+        self.send_event(PlayerEvent::TrackChanged {
+            audio_item: incoming_audio_item,
+        });
+        self.send_event(PlayerEvent::Playing {
+            play_request_id: incoming_play_request_id,
+            track_id: incoming_track_id,
+            position_ms: incoming_position_ms,
+        });
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn step_active_transition(&mut self) {
+        let volume = self.volume_getter.attenuation_factor();
+        let (step, reported_pos_ms, reported_track_id, reported_play_request_id) = {
+            let PlayerState::Transitioning(ref mut active) = self.state else {
+                return;
+            };
+            let step = active.step(&self.config, &mut self.master_limiter, volume, 512);
+            let meta = active.reported_meta();
+            (
+                step,
+                active.reported_position_ms(),
+                meta.track_id.clone(),
+                meta.play_request_id,
+            )
+        };
+
+        if !step.samples.is_empty() {
+            if let Err(e) = self
+                .sink
+                .write(AudioPacket::Samples(step.samples), &mut self.converter)
+            {
+                error!("{e}");
+                self.handle_pause();
+                return;
+            }
+        }
+
+        if let Some(incoming_pos_ms) = step.handoff_due_ms {
+            self.emit_transition_commit(incoming_pos_ms);
+        }
+
+        if let Some(interval) = self.config.position_update_interval {
+            let now = Instant::now();
+            if now.duration_since(self.last_progress_update) > interval {
+                self.last_progress_update = now;
+                self.send_event(PlayerEvent::PositionChanged {
+                    play_request_id: reported_play_request_id,
+                    track_id: reported_track_id,
+                    position_ms: reported_pos_ms,
+                });
+            }
+        }
+
+        if step.completed {
+            let PlayerState::Transitioning(active) =
+                mem::replace(&mut self.state, PlayerState::Invalid)
+            else {
+                return;
+            };
+            let (incoming_deck, next_frame, continuation) = active.into_incoming_continuation();
+            let meta = incoming_deck.meta;
+            let pos_ms = ((next_frame * 1000) / u64::from(SAMPLE_RATE)) as u32;
+            self.state = PlayerState::Playing {
+                track_id: meta.track_id,
+                play_request_id: meta.play_request_id,
+                decoder: incoming_deck.decoder,
+                audio_item: meta.audio_item,
+                normalisation_data: meta.normalisation_data,
+                normalisation_factor: incoming_deck.normalisation_factor,
+                stream_loader_controller: meta.stream_loader_controller,
+                bytes_per_second: meta.bytes_per_second,
+                duration_ms: meta.duration_ms,
+                stream_position_ms: pos_ms,
+                reported_nominal_start_time: Instant::now()
+                    .checked_sub(Duration::from_millis(u64::from(pos_ms))),
+                suggested_to_preload_next_track: false,
+                is_explicit: meta.is_explicit,
+                pending_normalized_pcm: VecDeque::from(continuation),
+            };
+        }
+    }
+
+    #[cfg(feature = "mix-transitions")]
+    fn drain_active_transition_abort_fade(&mut self) {
+        let volume = self.volume_getter.attenuation_factor();
+        let fade = {
+            let PlayerState::Transitioning(ref mut active) = self.state else {
+                return;
+            };
+            active.abort_and_drain(&self.config, &mut self.master_limiter, volume)
+        };
+        if !fade.is_empty() && self.sink_status == SinkStatus::Running {
+            if let Err(e) = self
+                .sink
+                .write(AudioPacket::Samples(fade), &mut self.converter)
+            {
+                warn!("Sink write error during transition abort fade: {e}");
+            }
+        }
     }
 
     fn preload_data_before_playback(&mut self) -> PlayerResult {
@@ -2632,6 +3414,13 @@ impl fmt::Debug for PlayerCommand {
                 .field(&next_tracks.len())
                 .field(&prev_tracks.len())
                 .finish(),
+            #[cfg(feature = "mix-transitions")]
+            PlayerCommand::ScheduleTransition { next_track_id, .. } => f
+                .debug_tuple("ScheduleTransition")
+                .field(&next_track_id)
+                .finish(),
+            #[cfg(feature = "mix-transitions")]
+            PlayerCommand::CancelTransition => f.debug_tuple("CancelTransition").finish(),
         }
     }
 }
@@ -2667,6 +3456,14 @@ impl fmt::Debug for PlayerState {
                 .debug_struct("Playing")
                 .field("track_id", &track_id)
                 .field("play_request_id", &play_request_id)
+                .finish(),
+            #[cfg(feature = "mix-transitions")]
+            Transitioning(active) => f
+                .debug_struct("Transitioning")
+                .field("outgoing", &active.outgoing_meta().track_id)
+                .field("incoming", &active.incoming_meta().track_id)
+                .field("committed", &active.is_committed())
+                .field("paused", &active.is_paused())
                 .finish(),
             EndOfTrack {
                 track_id,

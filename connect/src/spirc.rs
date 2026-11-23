@@ -765,6 +765,8 @@ impl SpircTask {
             SpircCommand::Load(command) => self.handle_load(command, None, None, None).await?,
             SpircCommand::AddToQueue(uri) => self.handle_add_to_queue(uri).await,
             SpircCommand::ClearQueue => {
+                #[cfg(feature = "mix-transitions")]
+                self.player.cancel_transition();
                 self.connect_state.clear_queue()?;
                 self.emit_set_queue_event();
             }
@@ -892,6 +894,31 @@ impl SpircTask {
             PlayerEvent::TimeToPreloadNextTrack { .. } => {
                 self.handle_preload_next_track();
                 return Ok(());
+            }
+            #[cfg(feature = "mix-transitions")]
+            PlayerEvent::TransitionStarted {
+                outgoing_track_id,
+                incoming_track_id,
+                ..
+            } => {
+                debug!("==> TransitionStarted: <{outgoing_track_id}> -> <{incoming_track_id}>");
+                return Ok(());
+            }
+            #[cfg(feature = "mix-transitions")]
+            PlayerEvent::TransitionCommit {
+                incoming_track_id,
+                incoming_play_request_id,
+                incoming_position_ms,
+                ..
+            } => {
+                debug!(
+                    "==> TransitionCommit: <{incoming_track_id}> at {incoming_position_ms} ms (req {incoming_play_request_id})"
+                );
+                self.handle_transition_commit(
+                    &incoming_track_id,
+                    incoming_play_request_id,
+                    incoming_position_ms,
+                )?;
             }
             PlayerEvent::Unavailable { track_id, .. } => {
                 self.handle_unavailable(&track_id)?;
@@ -1160,10 +1187,14 @@ impl SpircTask {
             }
             SetRepeatingTrack(repeat_track) => self.handle_repeat_track(repeat_track.value),
             AddToQueue(add_to_queue) => {
+                #[cfg(feature = "mix-transitions")]
+                self.player.cancel_transition();
                 self.connect_state.add_to_queue(add_to_queue.track, true);
                 self.emit_set_queue_event();
             }
             SetQueue(set_queue) => {
+                #[cfg(feature = "mix-transitions")]
+                self.player.cancel_transition();
                 self.connect_state.handle_set_queue(set_queue);
                 self.emit_set_queue_event();
             }
@@ -1183,6 +1214,8 @@ impl SpircTask {
 
                 if let Some(modes) = set_options.modes {
                     debug!("set_options modes: {modes:?}");
+                    #[cfg(feature = "mix-transitions")]
+                    self.player.cancel_transition();
                     self.connect_state.set_modes(modes);
                 }
             }
@@ -1645,6 +1678,8 @@ impl SpircTask {
     }
 
     fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
+        #[cfg(feature = "mix-transitions")]
+        self.player.cancel_transition();
         self.player.emit_shuffle_changed_event(shuffle);
         self.connect_state.handle_shuffle(shuffle)
     }
@@ -1656,12 +1691,16 @@ impl SpircTask {
     }
 
     fn handle_repeat_track(&mut self, repeat: bool) {
+        #[cfg(feature = "mix-transitions")]
+        self.player.cancel_transition();
         self.player
             .emit_repeat_changed_event(self.connect_state.repeat_context(), repeat);
         self.connect_state.set_repeat_track(repeat);
     }
 
     async fn handle_add_to_queue(&mut self, uri: SpotifyUri) {
+        #[cfg(feature = "mix-transitions")]
+        self.player.cancel_transition();
         let track_uris: Vec<String> = match uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } | SpotifyUri::Local { .. } => {
                 vec![uri.to_uri()]
@@ -1821,6 +1860,39 @@ impl SpircTask {
         self.set_volume(volume);
     }
 
+    #[cfg(feature = "mix-transitions")]
+    fn handle_transition_commit(
+        &mut self,
+        incoming_track_id: &SpotifyUri,
+        incoming_play_request_id: u64,
+        incoming_position_ms: u32,
+    ) -> Result<(), Error> {
+        if !self.connect_state.commit_transition_to(incoming_track_id)? {
+            warn!(
+                "TransitionCommit for <{incoming_track_id}> did not match next track in ConnectState; keeping existing queue intact"
+            );
+        }
+
+        self.add_autoplay_resolving_when_required();
+        self.play_request_id = Some(incoming_play_request_id);
+
+        let now = self.now_ms();
+        self.connect_state
+            .update_position(incoming_position_ms, now);
+        self.play_status = match self.play_status {
+            SpircPlayStatus::Paused { .. } => SpircPlayStatus::Paused {
+                position_ms: incoming_position_ms,
+                preloading_of_next_track_triggered: false,
+            },
+            _ => SpircPlayStatus::Playing {
+                nominal_start_time: now - i64::from(incoming_position_ms),
+                preloading_of_next_track_triggered: false,
+            },
+        };
+        self.connect_state.set_status(&self.play_status);
+        Ok(())
+    }
+
     fn handle_playlist_modification(
         &mut self,
         playlist_modification_info: PlaylistModificationInfo,
@@ -1838,6 +1910,8 @@ impl SpircTask {
         }
 
         debug!("playlist modification for current context: {uri}");
+        #[cfg(feature = "mix-transitions")]
+        self.player.cancel_transition();
         self.context_resolver.add(ResolveContext::from_uri(
             uri,
             self.connect_state.current_track(|t| &t.uri),
